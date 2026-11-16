@@ -128,26 +128,37 @@ def backpressure_limits():
             with socket.create_connection(('127.0.0.1', s.port)) as c:
                 c.sendall(b'GET /keys/a HTTP/1.1\r\nHost: x\r\nLong: '+b'x'*17000)
                 assert b' 431 ' in c.recv(4096)
-            for c in stalled:c.close()
-            stalled.clear()
-            for _ in range(8):
-                c=socket.create_connection(('127.0.0.1',s.port))
-                c.sendall(b'G')
-                stalled.append(c)
-            time.sleep(.1)
-            with socket.create_connection(('127.0.0.1',s.port)) as extra:
-                extra.settimeout(2)
-                try:
-                    extra.sendall(b'GET /keys/small HTTP/1.1\r\nHost: x\r\n\r\n')
-                    assert extra.recv(100)==b''
-                except ConnectionResetError:
-                    pass
-            for c in stalled:c.close()
-            stalled.clear()
-            time.sleep(.1)
-            assert s.call('GET','small')[0]==200
         finally:
-            for c in stalled:c.close()
+            for c in stalled:
+                c.close()
+            s.close()
+
+    with tempfile.TemporaryDirectory() as d:
+        s = Server(BINARY, d, '--idle-seconds', '30', '--max-connections', '8')
+        clients = []
+        request = b'GET /keys/missing HTTP/1.1\r\nHost: x\r\n\r\n'
+        try:
+            for _ in range(8):
+                c = socket.create_connection(('127.0.0.1', s.port), timeout=2)
+                clients.append(c)
+                c.sendall(request)
+                with http_client.HTTPResponse(c) as response:
+                    response.begin()
+                    assert response.status == 404 and not response.will_close
+                    response.read()
+            with socket.create_connection(('127.0.0.1', s.port), timeout=2) as extra:
+                try:
+                    extra.sendall(request)
+                    data = extra.recv(100)
+                    assert data == b'', data
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+            clients[-1].shutdown(socket.SHUT_WR)
+            assert clients[-1].recv(1) == b''
+            assert s.call('GET', 'missing')[0] == 404
+        finally:
+            for c in clients:
+                c.close()
             s.close()
 
 
