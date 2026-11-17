@@ -233,6 +233,7 @@ class Keyspace {
     }
     size_t size() const { return count_; }
     size_t heap_size() const { return heap_.size(); }
+    const Entry *heap_root() const { return heap_.empty() ? nullptr : heap_.front(); }
     size_t buckets() const { return old_.size(); }
     size_t new_buckets() const { return next_.size(); }
     void validate() const {

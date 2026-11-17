@@ -138,6 +138,8 @@ append는 EINTR/짧은 write를 반복하며 전체 레코드 성공 후에만 `
 
 ## 상품 API
 
+실제 Mini DBMS와 비교하려면 [Redis / DBMS 조회 실습](example/query-lab/README.md)을 실행하세요. 기본 키 조회와 조건 검색·정렬 쿼리의 직접 조회, Redis MISS, Redis HIT를 Mini React 화면에서 비교합니다.
+
 `example/products.json`을 시작 시 한 번 파싱해 메모리에 저장한다. `lookup_product()` 하나가 원본 조회와 카운터 증가를 담당한다. 요청마다 파일을 다시 읽지 않는다.
 
 ```sh

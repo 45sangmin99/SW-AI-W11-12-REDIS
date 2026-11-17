@@ -118,11 +118,23 @@ int main(int argc, char **argv) {
         int port = 6380, idle = 10;
         size_t max_connections = 256, memory = 64 * 1024 * 1024;
         Hooks hooks;
-        bool test = false;
+        bool test = false, trace_ttl = false, trace_rehash = false, rehash_all = false;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--test-hooks") {
                 test = true;
+                continue;
+            }
+            if (arg == "--trace-ttl") {
+                trace_ttl = true;
+                continue;
+            }
+            if (arg == "--trace-rehash") {
+                trace_rehash = true;
+                continue;
+            }
+            if (arg == "--rehash-all") {
+                rehash_all = true;
                 continue;
             }
             if (i + 1 == argc)
@@ -165,7 +177,8 @@ int main(int argc, char **argv) {
             throw std::runtime_error("option range");
         if (!test && (hooks.append_delay || hooks.sync_delay || hooks.repair_delay ||
                       hooks.fail_write_after != -1 || hooks.fail_sync || hooks.fail_prepare ||
-                      hooks.write_chunk || !hooks.events.empty()))
+                      hooks.write_chunk || !hooks.events.empty() || trace_ttl ||
+                      trace_rehash || rehash_all))
             throw std::runtime_error("injection requires --test-hooks");
         Keyspace ks(memory);
         int completion[2];
@@ -191,10 +204,20 @@ int main(int argc, char **argv) {
         std::vector<std::unique_ptr<Conn>> clients;
         // shortcut: one mutation in flight, batch only if write throughput requires it.
         std::optional<PendingWrite> pending;
+        auto log_ttl = [&](size_t expired) {
+            auto *root = ks.heap_root();
+            std::cerr << "ttl_heap {\"at\":" << wall_ms()
+                      << ",\"size\":" << ks.heap_size()
+                      << ",\"root\":" << (root ? quote(root->key) : "null")
+                      << ",\"expiry\":" << (root ? std::to_string(root->expiry) : "null")
+                      << ",\"expired\":" << expired << "}\n";
+        };
         auto finish_write = [&] {
             bool committed = false;
             try {
                 pending->commit(ks);
+                if (trace_ttl)
+                    log_ttl(0);
                 committed = !aof.failed;
             } catch (const std::exception &e) {
                 std::cerr << "write rejected: " << e.what() << "\n";
@@ -209,12 +232,34 @@ int main(int argc, char **argv) {
             }
             pending.reset();
         };
+        const auto clock_ns = [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        };
+        uint64_t traced_start = 0;
+        const auto rehash_step = [&] {
+            const bool tracing = trace_rehash && ks.new_buckets();
+            const bool starting = tracing && traced_start != ks.starts;
+            const auto begin = starting ? clock_ns() : 0;
+            const auto moved = starting ? ks.moved : 0;
+            ks.step(rehash_all ? SIZE_MAX : 4, rehash_all ? SIZE_MAX : 8);
+            const auto end = tracing && !ks.new_buckets() ? clock_ns() : 0;
+            if (starting) {
+                traced_start = ks.starts;
+                std::cerr << "rehash_trace start " << begin << " " << moved << "\n";
+            }
+            if (end)
+                std::cerr << "rehash_trace end " << end << " " << ks.moved << " "
+                          << ks.max_step_nodes << "\n";
+        };
         std::cerr << "ready " << host << ":" << port << "\n";
         uint64_t last_starts = ks.starts, last_finishes = ks.finishes;
         while (!stopping) {
             // A prepared update/delete may still reference this entry after it expires.
-            ks.expire(64, pending ? pending->pinned() : nullptr);
-            ks.step(4, 8);
+            auto expired = ks.expire(64, pending ? pending->pinned() : nullptr);
+            if (trace_ttl && expired)
+                log_ttl(expired);
+            rehash_step();
             if (ks.starts != last_starts || ks.finishes != last_finishes) {
                 std::cerr << wall_ms() << " rehash starts=" << ks.starts
                           << " finishes=" << ks.finishes << " moved=" << ks.moved
@@ -331,7 +376,7 @@ int main(int argc, char **argv) {
                         if (pending && &pending->client == &c)
                             break;
                         c.closing = r->close || (c.eof && c.input.empty());
-                        ks.step();
+                        rehash_step();
                     }
                     if ((re & POLLOUT) && !c.output.empty()) {
                         auto z = send(c.fd, c.output.data(),
