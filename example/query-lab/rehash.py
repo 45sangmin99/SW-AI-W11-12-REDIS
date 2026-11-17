@@ -32,11 +32,11 @@ def request(connection, method, key, value=None):
     return response.status, response.read()
 
 
-def seed(directory):
+def seed(directory, count=SEED_COUNT):
     server = Server(BINARY, directory)
     try:
         with closing(HTTPConnection("127.0.0.1", server.port, timeout=4)) as connection:
-            for index in range(SEED_COUNT):
+            for index in range(count):
                 assert request(connection, "PUT", f"existing-{index}", "probe")[0] == 204
         return server.aof
     finally:

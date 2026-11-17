@@ -84,12 +84,41 @@ function MigrationComparison({ comparison }) {
       "가장 긴 단계는 이동 작업이 한 번에 다른 요청 처리를 막을 수 있는 시간을 비교합니다. 전체 이동 시간에는 각 단계를 호출하는 비용도 들어갑니다."));
 }
 
+function RecordedRehashResults() {
+  // Recorded by rehash_sweep.py, with seven paired runs per condition.
+  const cases = [
+    [12288, 2000, 2.29, 2.79, 0, 0],
+    [49152, 500, 2.05, 6.12, 0, 4.19],
+    [49152, 2000, 2.28, 5.24, 0, 3.25],
+    [49152, 4000, 2.86, 4.77, 0, 1.17],
+    [196608, 2000, 2.33, 18.29, 0, 25.58],
+  ];
+  const number = value => value.toLocaleString("ko-KR");
+  return h("section", { class: "panel", "aria-labelledby": "rehash-recorded" },
+    h("h2", { id: "rehash-recorded" }, "사전 반복 측정 · 어떤 부하에서 유리했나?"),
+    h("p", {}, "초당 GET 2,000회에서 키 12,288개는 두 방식 모두 5ms를 넘지 않았습니다. 키 49,152개와 196,608개에서는 7쌍 모두 점진적 방식의 p99가 더 낮았습니다."),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ...[
+        "기존 키", "목표 GET/초", "GET p99 · 점진적", "GET p99 · 일괄", "5ms 초과 · 점진적", "5ms 초과 · 일괄",
+      ].map(title => h("th", { key: title, scope: "col" }, title)))),
+      h("tbody", {}, ...cases.map(([keys, rate, incremental, all, incrementalLate, allLate]) =>
+        h("tr", { key: `${keys}-${rate}` },
+          h("td", {}, number(keys)),
+          h("td", {}, number(rate)),
+          h("td", {}, `${incremental.toFixed(2)} ms`),
+          h("td", {}, `${all.toFixed(2)} ms`),
+          h("td", {}, `${incrementalLate}%`),
+          h("td", {}, `${allLate}%`)))))),
+    h("p", { class: "note" },
+      "로컬 WSL에서 PUT 한 번으로 확장을 시작하고 예정된 시각에 GET을 보냈습니다. 확장 시작 전 15ms~시작 후 40ms 구간을 조건당 7쌍 비교한 기록입니다. p99 열은 각 실행에서 구한 p99의 중앙값입니다. 위 실행 버튼은 별도의 단일 비교를 새로 수행합니다."));
+}
+
 function RehashResults({ result }) {
   const maxMs = Math.max(1, ...Object.values(result.modes).map(mode => mode.maxMs));
   const [left, right] = result.window;
   const x = ms => (ms - left) / (right - left) * 100;
   return h("section", { class: "panel", "aria-labelledby": "rehash-results" },
-    h("h2", { id: "rehash-results" }, "확장 순간의 GET 지연 비교"),
+    h("h2", { id: "rehash-results" }, "이번 실행 · 확장 순간의 GET 지연"),
     h("p", {}, `같은 기존 키 ${result.keys.toLocaleString("ko-KR")}개, 새 키 ${result.inserts}개, GET 연결 ${result.clients}개로 실행했습니다.`),
     h("p", { class: "note" }, "한꺼번에 옮기면 이벤트 루프가 이동을 마칠 때까지 GET이 기다립니다. 점진적 방식은 이동 단계 사이에도 GET을 처리할 수 있습니다."),
     h("p", { class: "note" }, "가로축 0ms는 각 서버가 노드 이동을 시작한 시점입니다. 같은 눈금 위에 이동 구간을 색으로 표시했습니다."),
@@ -195,6 +224,7 @@ function Lab() {
         h("button", { class: "run", type: "button", onClick: run, disabled: view.running },
           view.running ? "실행 중…" : engineLab?.button ?? "비교 실행"),
         h("span", { role: "status" }, view.status))),
+    ...(selected === "rehash" ? [RecordedRehashResults()] : []),
     ...(view.result ? (selected === "rehash"
       ? [RehashResults({ result: view.result }), MigrationComparison({ comparison: view.result.comparison })]
       : selected === "ttl" ? [TtlComparison({ comparison: view.result.comparison }), TtlResults({ result: view.result })]
