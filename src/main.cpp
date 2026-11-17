@@ -4,6 +4,7 @@
 #include <csignal>
 #include <poll.h>
 #include <sys/socket.h>
+#include <utility>
 using namespace mini;
 namespace {
 volatile sig_atomic_t stopping = 0;
@@ -31,6 +32,7 @@ void nonblock(int fd) {
 struct Conn {
     int fd = -1;
     std::string input, output;
+    std::optional<Request> deferred;
     bool closing = false, eof = false;
     std::chrono::steady_clock::time_point activity = std::chrono::steady_clock::now();
     ~Conn() {
@@ -38,7 +40,25 @@ struct Conn {
             close(fd);
     }
 };
-std::string execute(const Request &r, Keyspace &ks, Aof &aof, bool fail_prepare = false) {
+struct PendingWrite {
+    Conn &client;
+    bool close;
+    Keyspace::Prepared put;
+    Entry *del;
+    std::future<void> appended;
+
+    Entry *pinned() const { return del ? del : put.existing; }
+
+    void commit(Keyspace &ks) {
+        appended.get();
+        if (del)
+            ks.commit_delete(del);
+        else
+            ks.commit(std::move(put));
+    }
+};
+std::string execute(const Request &r, Conn &client, Keyspace &ks, Aof &aof,
+                    std::optional<PendingWrite> &pending, bool fail_prepare) {
     if (r.path.rfind("/keys/", 0) != 0)
         throw HttpError(404, "route");
     std::string segment = r.path.substr(6);
@@ -68,21 +88,18 @@ std::string execute(const Request &r, Keyspace &ks, Aof &aof, bool fail_prepare 
         if (fail_prepare)
             throw std::bad_alloc();
         auto prepared = ks.prepare(key, std::move(value), expiry);
-        aof.append('P', key, prepared.node->value, expiry);
-        ks.commit(std::move(prepared));
-        if (aof.failed)
-            throw std::runtime_error("AOF failed during commit");
-        return response(204, "", r.close);
+        auto result = aof.submit('P', std::move(key), prepared.node->value, expiry);
+        pending.emplace(PendingWrite{client, r.close, std::move(prepared), nullptr,
+                                     std::move(result)});
+        return {};
     }
-    auto *e = ks.get(key);
+    auto *e = ks.get(key, pending ? pending->pinned() : nullptr);
     if (!e)
         throw HttpError(404, "key not found");
     if (r.method == "DELETE") {
-        aof.append('D', key, "", 0);
-        ks.commit_delete(e);
-        if (aof.failed)
-            throw std::runtime_error("AOF failed during delete");
-        return response(204, "", r.close);
+        auto result = aof.submit('D', std::move(key), "", 0);
+        pending.emplace(PendingWrite{client, r.close, {}, e, std::move(result)});
+        return {};
     }
     if (ttl) {
         int64_t remain = e->expiry ? remaining_seconds(e->expiry, wall_ms()) : 0;
@@ -151,7 +168,11 @@ int main(int argc, char **argv) {
                       hooks.write_chunk || !hooks.events.empty()))
             throw std::runtime_error("injection requires --test-hooks");
         Keyspace ks(memory);
-        Aof aof(path, ks, hooks);
+        int completion[2];
+        if (pipe(completion) < 0)
+            throw std::runtime_error("AOF completion pipe");
+        Fd completion_read(completion[0]), completion_write(completion[1]);
+        Aof aof(path, ks, completion_write.n, hooks);
         Fd listener(socket(AF_INET, SOCK_STREAM, 0));
         if (listener.n < 0)
             throw std::runtime_error("socket");
@@ -168,10 +189,31 @@ int main(int argc, char **argv) {
         signal(SIGINT, stop);
         signal(SIGTERM, stop);
         std::vector<std::unique_ptr<Conn>> clients;
+        // shortcut: one mutation in flight, batch only if write throughput requires it.
+        std::optional<PendingWrite> pending;
+        auto finish_write = [&] {
+            bool committed = false;
+            try {
+                pending->commit(ks);
+                committed = !aof.failed;
+            } catch (const std::exception &e) {
+                std::cerr << "write rejected: " << e.what() << "\n";
+            }
+            auto &client = pending->client;
+            if (!client.closing) {
+                client.output += committed
+                    ? response(204, "", pending->close)
+                    : response(503, "{\"error\":\"write unavailable\"}", pending->close);
+                client.closing = pending->close || (client.eof && client.input.empty());
+                client.activity = std::chrono::steady_clock::now();
+            }
+            pending.reset();
+        };
         std::cerr << "ready " << host << ":" << port << "\n";
         uint64_t last_starts = ks.starts, last_finishes = ks.finishes;
         while (!stopping) {
-            ks.expire(64);
+            // A prepared update/delete may still reference this entry after it expires.
+            ks.expire(64, pending ? pending->pinned() : nullptr);
             ks.step(4, 8);
             if (ks.starts != last_starts || ks.finishes != last_finishes) {
                 std::cerr << wall_ms() << " rehash starts=" << ks.starts
@@ -183,16 +225,28 @@ int main(int argc, char **argv) {
                 last_starts = ks.starts;
                 last_finishes = ks.finishes;
             }
-            std::vector<pollfd> fds{{listener.n, POLLIN, 0}};
+            std::vector<pollfd> fds{{listener.n, POLLIN, 0}, {completion_read.n, POLLIN, 0}};
             for (auto &c : clients)
                 fds.push_back(
-                    {c->fd,
-                     short((!c->closing && !c->eof && c->output.size() < 2 * 1048576 ? POLLIN : 0) |
+                    {c->closing && c->output.empty() ? -1 : c->fd,
+                     short((!c->closing && !c->eof && !c->deferred &&
+                            (!pending || &pending->client != c.get()) &&
+                            c->output.size() < 2 * 1048576 ? POLLIN : 0) |
                            (!c->output.empty() ? POLLOUT : 0)),
                      0});
             int ready = poll(fds.data(), fds.size(), 10);
             if (ready < 0 && errno != EINTR)
                 throw std::runtime_error("poll");
+            if (fds[1].revents & POLLIN) {
+                char byte;
+                ssize_t n;
+                do {
+                    n = read(completion_read.n, &byte, 1);
+                } while (n < 0 && errno == EINTR);
+                if (n != 1)
+                    throw std::runtime_error("AOF completion read");
+                finish_write();
+            }
             if (fds[0].revents & POLLIN)
                 for (int n = 0; n < 16; ++n) {
                     int fd = accept(listener.n, nullptr, nullptr);
@@ -210,15 +264,16 @@ int main(int argc, char **argv) {
                     clients.push_back(std::move(c));
                 }
             size_t commands = 0;
-            for (size_t i = 0; i + 1 < fds.size(); ++i) {
+            for (size_t i = 0; i + 2 < fds.size(); ++i) {
                 auto &c = *clients[i];
-                auto re = fds[i + 1].revents;
+                auto re = fds[i + 2].revents;
                 if (re & (POLLERR | POLLNVAL)) {
                     c.closing = true;
                     c.output.clear();
                 }
                 try {
-                    if ((re & POLLIN) && !c.closing) {
+                    if ((re & POLLIN) && !c.closing && !c.deferred &&
+                        (!pending || &pending->client != &c)) {
                         char buf[16384];
                         for (int n = 0; n < 4; ++n) {
                             auto z = recv(c.fd, buf, sizeof buf, 0);
@@ -237,9 +292,13 @@ int main(int argc, char **argv) {
                         }
                     }
                     for (int n = 0;
-                         n < 4 && !c.closing && commands < 64 && c.output.size() < 2 * 1048576;
+                         n < 4 && !c.closing && commands < 64 && c.output.size() < 2 * 1048576 &&
+                         (!pending || &pending->client != &c);
                          ++n) {
-                        auto r = request(c.input);
+                        if (c.deferred && pending)
+                            break;
+                        auto r = c.deferred ? std::exchange(c.deferred, std::nullopt)
+                                            : request(c.input);
                         if (!r) {
                             if (c.eof) {
                                 if (!c.input.empty())
@@ -248,9 +307,13 @@ int main(int argc, char **argv) {
                             }
                             break;
                         }
+                        if (pending && (r->method == "PUT" || r->method == "DELETE")) {
+                            c.deferred = std::move(r);
+                            break;
+                        }
                         ++commands;
                         try {
-                            c.output += execute(*r, ks, aof, hooks.fail_prepare);
+                            c.output += execute(*r, c, ks, aof, pending, hooks.fail_prepare);
                         } catch (const HttpError &e) {
                             c.output +=
                                 response(e.status, "{\"error\":" + quote(e.what()) + "}", r->close);
@@ -265,6 +328,8 @@ int main(int argc, char **argv) {
                             c.output +=
                                 response(503, "{\"error\":\"write unavailable\"}", r->close);
                         }
+                        if (pending && &pending->client == &c)
+                            break;
                         c.closing = r->close || (c.eof && c.input.empty());
                         ks.step();
                     }
@@ -296,11 +361,16 @@ int main(int argc, char **argv) {
                 }
             }
             clients.erase(std::remove_if(clients.begin(), clients.end(),
-                                         [](auto &c) { return c->closing && c->output.empty(); }),
+                                         [&](auto &c) {
+                                             return c->closing && c->output.empty() &&
+                                                    (!pending || &pending->client != c.get());
+                                         }),
                           clients.end());
             if (clients.size() > 1)
                 std::rotate(clients.begin(), clients.begin() + 1, clients.end());
         }
+        if (pending)
+            finish_write();
         ks.validate();
         std::cerr << "shutdown appended=" << aof.appended << " synced=" << aof.synced
                   << " moved=" << ks.moved << " scanned=" << ks.scanned

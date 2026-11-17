@@ -153,10 +153,11 @@ class Keyspace {
                                                 std::chrono::steady_clock::now() - begin)
                                                 .count());
     }
-    Entry *get(const std::string &k) {
+    Entry *get(const std::string &k, const Entry *pinned = nullptr) {
         auto *e = locate(k);
         if (e && e->expiry && clock_() >= e->expiry) {
-            erase(e);
+            if (e != pinned)
+                erase(e);
             return nullptr;
         }
         return e;
@@ -221,9 +222,10 @@ class Keyspace {
         erase(e);
         return true;
     }
-    size_t expire(size_t budget = 64) {
+    size_t expire(size_t budget = 64, const Entry *pinned = nullptr) {
         size_t n = 0;
-        while (n < budget && !heap_.empty() && heap_[0]->expiry <= clock_()) {
+        while (n < budget && !heap_.empty() && heap_[0] != pinned &&
+               heap_[0]->expiry <= clock_()) {
             erase(heap_[0]);
             ++n;
         }

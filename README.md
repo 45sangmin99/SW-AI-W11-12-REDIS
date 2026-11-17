@@ -70,14 +70,14 @@ curl -i http://127.0.0.1:6380/keys/keyboard
 | 파일 | 책임 |
 |---|---|
 | `src/engine.hpp` | 키/값 소유, FNV-1a, chaining, 점진적 재배치, indexed heap, validate |
-| `src/aof.hpp` | 바이너리 레코드, 잠금, append/replay/repair, 백그라운드 fsync |
+| `src/aof.hpp` | 바이너리 레코드, 잠금, replay/repair, 백그라운드 append와 fsync |
 | `src/http.hpp`, `src/text.hpp` | 스트리밍 HTTP/엄격한 JSON/UTF-8 검증과 직렬화 |
 | `src/main.cpp` | CLI, 소켓 RAII, poll 연결 루프, HTTP→명령 매핑 |
 | `tests/` | 단위/실제 프로세스 통합/실패 주입 및 실행 결과 |
 | `example/` | 한 번 로드한 상품 데이터와 별도 HTTP API |
 | `benchmarks/` | 재현 스크립트, 직접 GET 측정, 관측 결과/타임라인 |
 
-키 공간에 접근하는 실행 흐름은 이벤트 루프 하나다. 연결별 명령 스레드를 만들지 않는다. HTTP 파싱 → 검증 → 명령 실행 → 응답 생성이 이 흐름에서 직렬 실행된다. GET은 한 PUT의 완전한 문자열을 읽는다. DELETE 204 완료 후 새 PUT 없이 시작한 GET은 404다. 백그라운드 스레드는 AOF fd/원자적 watermark/종료 상태만 다루며 키 공간을 보지 않는다.
+키 공간은 이벤트 루프만 수정한다. AOF 스레드는 로그를 쓰고 동기화하며, 완료를 파이프로 알려 `poll()`을 깨운다. 변경 명령은 한 건씩 처리한다. 대기 중인 연결은 후속 명령을 실행하지 않으며, 다른 연결의 GET은 마지막으로 반영된 유효한 값을 읽는다. 다른 연결에 대기 중인 변경이 있으면 연결당 요청 하나를 보류해 응답 순서를 유지한다. DELETE 204 완료 후 새 PUT 없이 시작한 GET은 404다.
 
 리스닝/연결 소켓은 non-blocking이고 poll()을 사용한다. 부분 recv/send, 연속 요청, Keep-Alive와 pipeline을 지원하며 같은 연결 응답은 FIFO다. 매 연결 read/write는 반복당 각각 최대 64KiB, 명령은 연결당 4개/전체 64개, accept는 16개다. 연결 처리 시작점을 회전한다. TTL active 정리는 반복당 64개다. 기본 poll 대기는 10ms다.
 
@@ -100,6 +100,8 @@ FNV-1a 64비트를 직접 구현했다. 최초 버킷은 4개이며 2의 거듭�
 validate는 실제 노드 수/바이트 수, 올바른 버킷, 키 중복, 엔트리와 heap의 양방향 일치, heap 순서를 검사한다. 복구 완료 후 listen 이전과 정상 종료 시 실행하며 hot path에서 매번 호출하지 않는다. 단위 무작위 검사에서는 주기적으로 실행한다.
 
 TTL은 Unix epoch ms 절대 시각이다. TTL 없는 엔트리는 heap에 없다. 엔트리는 heap index를 보유하고 heap은 안정적인 엔트리 포인터를 보유한다. 갱신/제거는 O(log n), key lookup은 해시 테이블을 사용한다. TTL 재설정/해제/삭제/재생성 시 오래된 예약을 남기지 않는다. Passive expiration은 키 접근 때 항상 확인하고, active expiration은 heap root부터 예산 내에서 지운다. 만료 DEL은 AOF에 따로 쓰지 않는다.
+
+AOF 완료를 기다리는 갱신이나 삭제가 기존 엔트리를 참조하면, 해당 엔트리는 완료까지 해제하지 않는다. 만료된 값은 조회에서 숨기며, 해당 엔트리가 heap root에 있으면 그 뒤의 active 정리도 완료까지 밀릴 수 있다.
 
 테스트에 시계를 주입해 만료 1ms 전/정확한 경계/동시 만료/정리 예산을 sleep 없이 확인하고, 1200ms→2초/100ms→1초 및 큰 정수의 올림을 단위 검사했다. HTTP 테스트는 실제 경과도 확인한다. 벽시계가 뒤로 이동하면 아직 제거되지 않은 키의 실제 수명이 길어질 수 있고, 앞으로 뛰면 즉시 만료될 수 있다. 이미 제거한 엔트리는 시계가 돌아와도 현재 프로세스에서 복구하지 않는다. AOF가 절대 시각을 보유하므로 벽시계 역행 후 재시작에서는 이전 만료 PUT이 다시 유효하게 해석될 여지가 있다. monotonic TTL로 의미를 바꾸지 않았으며 시계 동기화가 운영 전제다.
 
@@ -124,9 +126,9 @@ PUT은 JSON/TTL/논리 한도 검사 → 문자열·노드·heap capacity·필�
 
 CRC32는 표준 IEEE 다항식 0xEDB88320이다. 레코드 최대 1,100,000바이트, 키 최대 512바이트, 값 최대 1MiB다. 헤더 자체 CRC가 길이 필드 손상을 검출하므로 중간 길이 손상을 잘린 꼬리로 오인해 지우지 않는다. CRC는 악의적 변조를 인증하지 않는다.
 
-append는 EINTR/짧은 write를 반복하며 전체 레코드 성공 후에만 `appended_seq`를 게시한다. 실패하면 메모리에 반영하지 않고 프로세스 수명 동안 이후 변경을 차단한다. 부분 레코드는 남을 수 있으며 다음 시작에서 규칙에 맞는 꼬리만 절단한다. 읽기/TTL은 계속 제공한다. 이미 append와 commit이 끝났어도 fsync 실패가 그 사이 관측되면 503을 보낼 수 있다. **실패 응답이나 끊긴 연결은 rollback을 뜻하지 않는다.** 재시도 전에 현재 상태를 확인할 수 있지만, 이 API는 exactly-once 요청 식별을 제공하지 않는다.
+append는 EINTR/짧은 write를 반복하며 전체 레코드 성공 후에만 `appended_seq`를 게시한다. I/O 실패 시 해당 변경을 메모리에 반영하지 않고 이후 변경을 차단한다. 부분 레코드는 남을 수 있으며 다음 시작에서 규칙에 맞는 꼬리만 절단한다. 읽기/TTL은 계속 제공한다. 성공한 append는 연결이 끊겨도 반영한다. append 성공 후 메모리 반영 시점에 fsync 실패를 관측하면 503을 보낼 수 있다. **실패 응답이나 끊긴 연결은 rollback을 뜻하지 않는다.** 이 API는 exactly-once 요청 식별을 제공하지 않는다.
 
-백그라운드 스레드는 약 1초 대기 후 dirty 여부를 확인한다. 새 append가 없으면 fsync를 생략한다. 호출 직전 `target_seq=appended_seq`를 저장하고 AOF 상태 mutex 없이 `fsync(fd)`를 실행한다. 성공하면 `synced_seq=target_seq`까지만 게시한다. 겹친 이후 append는 다음 주기에 남는다. GET/TTL은 이 스레드와 공유 락을 잡지 않는다. 종료 플래그의 condition-variable mutex와 시험 이벤트 파일 mutex는 fsync 호출 동안 유지하지 않는다. fsync 실패는 stderr/시험 이벤트/이후 변경 요청 503으로 드러나며 GET/TTL은 허용한다.
+백그라운드 스레드는 약 1초 주기로 dirty 여부를 확인하고, 새 append가 있을 때만 `fsync(fd)`를 실행한다. 같은 스레드에서 두 I/O를 직렬화하므로 fsync 도중 제출된 append는 동기화가 끝난 뒤 실행된다. 그동안 GET/TTL을 계속 처리한다. fsync 실패는 stderr/시험 이벤트/이후 변경 요청 503으로 드러난다.
 
 시작 시 flock(LOCK_EX|LOCK_NB) → 파일 크기/각 헤더·레코드 CRC/길이·type·sequence·텍스트·만료 의미 검사 → 동일 keyspace 변경 경로로 replay → 복구 파일 fsync/워터마크 초기화 → 만료 제거/validate → 부모 디렉터리 fsync → listen 순서다. 복구된 완전한 레코드도 시작 시 fsync한 다음 synced watermark를 설정한다. 같은 AOF 파일을 두 프로세스가 동시에 소유할 수 없다. 잠금은 같은 inode를 대상으로 하므로 운영 중 AOF를 외부에서 교체/수정/삭제해서는 안 된다.
 
@@ -168,18 +170,39 @@ python3 benchmarks/run.py ./build/mini-redis
 | `concurrent_linearization` | barrier로 8 writers+8 readers 겹침, PUT 160회/GET 480회 완전 값, DELETE 후 GET 80회 모두 404 |
 | `recovery_sigkill_tail_corruption_lock` | sync 완료 후 SIGKILL/재시작, DEL/TTL 비연장·다운 중 만료, tail repair+추가 PUT+재시작, 본문·길이 손상 거부, 중복 소유 거부 |
 | `interrupted_tail_repair` | ftruncate 직후 fsync 전 강제 종료, 반복 복구 및 추가 append 유지 |
-| `write_sync_memory_failures` | write 0/12바이트 후 실패, 메모리 한도, fsync 오류, append와 겹친 fsync 오류에서 204 금지 |
+| `write_sync_memory_failures` | write 0/12바이트 후 실패, 메모리 한도, fsync 실패 동안 대기한 쓰기는 로그와 메모리에 반영되지 않음 |
 | `prepare_failure_short_writes` | 준비 실패 시 로그/키 불변, 3바이트씩 짧은 write 반복 성공 및 replay |
 | `sigkill_during_append` | 동기화 완료 키 유지, 다음 append 지연 도중 SIGKILL, 미완료 요청의 연결 종료 |
-| `fsync_watermark_overlap` | fsync cycle 시작 확인 → 완료 전 GET·새 PUT 완료, target=1 완료 때 seq=2 완료로 오표시하지 않음, 다음 sync 후 SIGKILL 복구 |
-| `append_blocks_get` | append 지연 시작 이벤트 후 실제 GET을 보내 대기 지연 확인 |
+| `fsync_watermark_overlap` | fsync 도중 GET 완료, 새 PUT의 append는 이전 fsync 이후 시작, 다음 sync 후 SIGKILL 복구 |
+| `append_allows_get` | append 지연 중 GET이 이전 값을 반환하고, 뒤따른 DELETE가 진행 중인 PUT 이후 적용됨 |
 | `product_cache_scenarios` | 첫 MISS/두 번째 HIT/실제 TTL 만료/DELETE 후 MISS, origin 1→3, OFF 본문 동일, 덮어쓰기, Redis 장애 502 |
 
 오류/지연 주입은 `--test-hooks`를 명시해야 활성화된다. 기본에는 시험 HTTP 엔드포인트가 없다. 옵션은 `--append-delay-ms`, `--sync-delay-ms`, `--repair-delay-ms`, `--fail-write-after`(레코드별 성공 바이트 수, 기본 -1), `--write-chunk-size`, `--fail-sync 1`, `--fail-prepare 1`, `--events PATH`다. sync 지연은 **fsync syscall 직전**에 놓인 시험 지연이며 실제 커널 syscall을 느리게 만든 것이 아니다. 이벤트 파일은 epoch ms와 append_start/done/error, sync_start/done/error 및 target sequence, repair_truncated를 기록한다. 프로덕션 명령 계약과 분리했다. 실제 disk-full/파일시스템 I/O fault는 수행하지 않았고 동일 실패 분기를 시험 후크로 재현했다.
 
-## 측정 환경과 재현
+## 백그라운드 append 변경 전후
 
-2026-11-16, Apple M2, RAM 8GiB, Darwin 25.5.0/macOS ARM64, Apple Clang 21.0.0, Python 3.9.6. 성능 수치는 Make **`-std=c++20 -O2 -g -pthread`** 빌드다. CMake Release 검사는 별도로 수행했다. 모든 서비스/클라이언트는 loopback의 같은 호스트에 있다. 프로세스를 코어에 고정하거나 다른 호스트 작업을 차단하지 않았다. 실행마다 OS의 빈 포트를 사용하고 임시 AOF를 생성/정리한다. AOF 1초 fsync 설정과 시험 이벤트 계측은 모든 비교군에서 동일하다.
+2026-11-17, 같은 WSL 환경에서 g++ `-std=c++20 -O2 -g -pthread`로 빌드하고 `engine_bench()`를 변경 전 → 후 → 후 → 전 순으로 실행했다. 각 실행은 GET 클라이언트 8개, 조건별 GET 1,600건이다. 수치는 버전별 두 실행의 범위이며 단위는 ms다. 요청 실패는 모두 0건이었다.
+
+| 조건과 지표 | 변경 전 | 변경 후 |
+|---|---:|---:|
+| append 50ms 지연, GET p95 | 50.18–50.24 | 3.93–4.34 |
+| append 50ms 지연, GET p99 | 53.92–54.33 | 5.32–6.82 |
+| append 50ms 지연, PUT p95 | 71.89–71.96 | 60.55–65.35 |
+| 지연 주입 없이 GET과 확장 PUT 600건, GET p95 | 5.92–5.97 | 6.21–6.71 |
+| 지연 주입 없이 GET과 확장 PUT 600건, PUT p95 | 7.92–9.40 | 8.73–10.18 |
+
+지연 주입은 느린 append가 다른 클라이언트에 미치는 영향을 확인하는 실험이다. 주입 없는 혼합 부하에서는 GET p95 개선이 관측되지 않았다. `fsync`가 길어지면 같은 스레드에 맡긴 새 append도 기다린다.
+
+같은 컴파일러와 플래그로 빌드한 두 바이너리를 지정해 엔진 벤치마크만 실행할 수 있다.
+
+```sh
+PYTHONPATH=benchmarks python3 -c 'import run; run.engine_bench()' ./build/mini-redis-before
+PYTHONPATH=benchmarks python3 -c 'import run; run.engine_bench()' ./build/mini-redis
+```
+
+## 기존 macOS 측정 환경과 재현
+
+아래 macOS 측정은 명령 스레드에서 동기 append를 실행하던 버전의 기록이다. 2026-11-16, Apple M2, RAM 8GiB, Darwin 25.5.0/macOS ARM64, Apple Clang 21.0.0, Python 3.9.6. 성능 수치는 Make **`-std=c++20 -O2 -g -pthread`** 빌드다. 모든 서비스/클라이언트는 loopback의 같은 호스트에 있다. 실행마다 OS의 빈 포트를 사용하고 임시 AOF를 생성/정리한다.
 
 ```sh
 make -B -j2 all build/engine-bench
@@ -226,7 +249,7 @@ HTTP GET 병목은 모든 군에서 클라이언트 8개×200회=1,600 GET, 기�
 
 | 평가 항목 | 구현 | 증거/결과 |
 |---|---|---|
-| 동시성 | 단일 poll 명령 실행/원자적 commit | `concurrent_linearization`, `append_blocks_get` 통과 |
+| 동시성 | 단일 poll 명령 실행, 백그라운드 append 후 commit | `concurrent_linearization`, `append_allows_get` |
 | 만료 | 절대 TTL/indexed heap/passive+active | 단위 시계·heap 검증, `http_contract`, `recovery_sigkill_tail_corruption_lock` 통과 |
 | 외부 API | 한 번 로드/공통 lookup/캐시 어사이드 | `product_cache_scenarios`, 6개 상품 측정 군 성공 |
 | 무효화 | append 후 엔트리+heap 제거 | DELETE 후 GET 80회 404, 상품 원본 재조회 통과 |
@@ -236,4 +259,4 @@ HTTP GET 병목은 모든 군에서 클라이언트 8개×200회=1,600 GET, 기�
 
 필수 네 API, HTTP 서버, 자체 해시/TTL, AOF, 예제 API, 자동 테스트와 성능 측정은 구현했다. 제외 범위는 복제/클러스터/RESP/트랜잭션/추가 명령/메모리 축출/디스크 계층화다. AOF rewrite/압축은 없으므로 로그는 계속 커지고 복구는 로그 길이에 비례한다. 키 공간 cap은 RSS cap이 아니다. 헤더 이름/Content-Type 등은 제한된 HTTP subset이며 범용 웹 서버가 아니다. 대형 동시 워크로드에서 전체 메모리/RSS 압력이나 랜덤 해시 공격 방어를 인증하지 않았다(FNV는 비밀키 없는 해시).
 
-실제 전원 차단/스토리지 손실, Linux 실행, ThreadSanitizer, 파일시스템 자체 오류/ENOSPC, 광범위한 장시간 soak/fuzz, allocator 실패 위치의 완전한 열거는 **미검증**이다. ASan/UBSan과 실행 가능한 후크 범위는 실제 수행했다. 물리 내구성 검증에는 별도 VM/파일시스템 fault 도구/전원 차단 환경이 필요하다. 성능 결과는 이 호스트·이 요청 패턴의 관측값이며 보편적인 캐시 가속이나 엄격한 tail latency 보장이 아니다.
+실제 전원 차단/스토리지 손실, ThreadSanitizer, 파일시스템 자체 오류/ENOSPC, 광범위한 장시간 soak/fuzz, allocator 실패 위치의 완전한 열거는 미검증이다. macOS ASan/UBSan 결과는 기존 버전에서 기록했다. 백그라운드 append 변경은 WSL에서 단위 테스트와 통합 테스트를 실행했다.

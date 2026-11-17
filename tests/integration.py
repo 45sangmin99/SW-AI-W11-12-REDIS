@@ -294,15 +294,16 @@ def faults():
         assert s.call('GET', 'large')[0] == 404
         s.close()
 
-    # Failure published by fsync while a second append is already in flight.
+    # A write queued during a failing fsync must never reach append.
     with tempfile.TemporaryDirectory() as d:
-        s = Server(BINARY, d, '--append-delay-ms', '1200', '--fail-sync', '1')
+        s = Server(BINARY, d, '--sync-delay-ms', '600', '--fail-sync', '1')
         try:
             assert s.call('PUT', 'a', {'value': 'first'})[0] == 204
-            assert s.call('PUT', 'b', {'value': 'inflight'})[0] == 503
+            wait_for(lambda: s.event('sync_start 1'))
+            assert s.call('PUT', 'b', {'value': 'queued'})[0] == 503
             assert s.event('sync_error')
-            # The failed request may already have committed; never claim rollback.
-            assert s.call('GET', 'b')[0] == 200
+            assert not s.event('append_start 2')
+            assert s.call('GET', 'b')[0] == 404
             assert s.call('PUT', 'c', {'value': 'blocked'})[0] == 503
         finally:
             s.close()
@@ -356,7 +357,8 @@ def sync_overlap():
             assert time.monotonic()-start < .8
             assert not s.event('sync_done 1')
             assert s.call('PUT', 'b', {'value': 'B'})[0] == 204
-            wait_for(lambda: s.event('sync_done 1'))
+            events = s.events.read_text()
+            assert events.index('sync_done 1') < events.index('append_start 2')
             assert not s.event('sync_done 2')
             wait_for(lambda: s.event('sync_done 2'))
             s.close(kill=True)
@@ -368,19 +370,17 @@ def sync_overlap():
 
 def append_overlap():
     with tempfile.TemporaryDirectory() as d:
-        s = Server(BINARY, d, '--append-delay-ms', '100')
+        s = Server(BINARY, d, '--append-delay-ms', '500')
         try:
             s.call('PUT', 'a', {'value': 'A'})
-            done = threading.Event()
-            def put():
-                assert s.call('PUT', 'b', {'value': 'B'})[0] == 204
-                done.set()
-            t = threading.Thread(target=put);t.start()
-            wait_for(lambda: s.event('append_start 2'))
-            start = time.monotonic()
-            assert s.call('GET', 'a')[0] == 200
-            elapsed = time.monotonic()-start
-            t.join();assert done.is_set() and elapsed > .05, elapsed
+            with concurrent.futures.ThreadPoolExecutor(2) as ex:
+                put = ex.submit(s.call, 'PUT', 'a', {'value': 'B'})
+                wait_for(lambda: s.event('append_start 2'))
+                assert json.loads(s.call('GET', 'a')[1]) == {'value': 'A'}
+                assert not s.event('append_done 2')
+                delete = ex.submit(s.call, 'DELETE', 'a')
+                assert put.result()[0] == delete.result()[0] == 204
+            assert s.call('GET', 'a')[0] == 404
         finally:
             s.close()
 
@@ -422,6 +422,6 @@ if __name__ == '__main__':
                      ('write_sync_memory_failures', faults),
                      ('prepare_failure_short_writes', prepare_and_short_write),
                      ('sigkill_during_append', kill_during_append), ('fsync_watermark_overlap', sync_overlap),
-                     ('append_blocks_get', append_overlap), ('product_cache_scenarios', products)]:
+                     ('append_allows_get', append_overlap), ('product_cache_scenarios', products)]:
         check(name, fn)
     print(f'{len(passed)} integration groups PASS')

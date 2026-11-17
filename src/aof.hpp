@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <sys/file.h>
@@ -41,12 +42,12 @@ class Aof {
     int fd_ = -1;
     Hooks hooks_;
     std::thread worker_;
-    std::mutex mutex_, events_mutex_;
+    std::mutex mutex_;
     std::condition_variable cv_;
+    std::packaged_task<void()> job_;
     bool stop_ = false;
     void event(const std::string &s) noexcept {
         try {
-            std::lock_guard lock(events_mutex_);
             if (!hooks_.events.empty()) {
                 std::string line = std::to_string(wall_ms()) + " " + s + "\n";
                 int f = open(hooks_.events.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
@@ -162,7 +163,8 @@ class Aof {
   public:
     std::atomic<uint64_t> appended{0}, synced{0};
     std::atomic<bool> failed{false};
-    Aof(const std::string &path, Keyspace &ks, Hooks h = {}) : hooks_(std::move(h)) {
+    Aof(const std::string &path, Keyspace &ks, int completion_fd, Hooks h = {})
+        : hooks_(std::move(h)) {
         fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0600);
         if (fd_ < 0)
             throw std::runtime_error("open AOF: " + std::string(strerror(errno)));
@@ -181,12 +183,33 @@ class Aof {
             close(dir);
             if (synced_dir < 0)
                 throw std::runtime_error("fsync AOF directory");
-            worker_ = std::thread([this] {
+            worker_ = std::thread([this, completion_fd] {
+                using Clock = std::chrono::steady_clock;
+                using namespace std::chrono_literals;
+                auto next_sync = Clock::now() + 1s;
                 std::unique_lock lock(mutex_);
-                while (!cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
-                    lock.unlock();
-                    sync_once();
-                    lock.lock();
+                for (;;) {
+                    cv_.wait_until(lock, next_sync, [this] { return stop_ || job_.valid(); });
+                    if (!stop_ && Clock::now() >= next_sync) {
+                        lock.unlock();
+                        sync_once();
+                        next_sync = Clock::now() + 1s;
+                        lock.lock();
+                    }
+                    if (job_.valid()) {
+                        auto job = std::move(job_);
+                        lock.unlock();
+                        job();
+                        ssize_t sent;
+                        do {
+                            sent = write(completion_fd, "x", 1);
+                        } while (sent < 0 && errno == EINTR);
+                        if (sent != 1)
+                            std::terminate();
+                        lock.lock();
+                    }
+                    if (stop_)
+                        break;
                 }
                 lock.unlock();
                 sync_once();
@@ -208,7 +231,22 @@ class Aof {
         if (fd_ >= 0)
             close(fd_);
     }
-    // Called only by the event loop. No fallible work follows successful publication.
+    // The event loop submits at most one mutation until it consumes the completion.
+    std::future<void> submit(char op, std::string key, std::string value, int64_t expiry) {
+        std::packaged_task<void()> job(
+            [this, op, key = std::move(key), value = std::move(value), expiry] {
+                append(op, key, value, expiry);
+            });
+        auto result = job.get_future();
+        {
+            std::lock_guard lock(mutex_);
+            job_ = std::move(job);
+        }
+        cv_.notify_one();
+        return result;
+    }
+
+  private:
     void append(char op, const std::string &key, const std::string &value, int64_t expiry) {
         if (failed)
             throw std::runtime_error("AOF write blocked");

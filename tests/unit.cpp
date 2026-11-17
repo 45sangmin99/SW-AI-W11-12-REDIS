@@ -87,6 +87,14 @@ int main() {
         ks.expire(1000);
         ks.validate();
         ks.del("a");
+        ks.put("pending", "old", now + 1);
+        auto pending = ks.prepare("pending", "new", 0);
+        ++now;
+        CHECK(ks.expire(64, pending.existing) == 0);
+        CHECK(!ks.get("pending", pending.existing));
+        ks.commit(std::move(pending));
+        CHECK(ks.get("pending")->value == "new");
+        ks.del("pending");
         std::unordered_map<std::string, std::pair<std::string, int64_t>> model;
         std::mt19937 rng(44);
         for (int i = 0; i < 40000; ++i) {
