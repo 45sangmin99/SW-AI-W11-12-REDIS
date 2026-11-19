@@ -1,6 +1,5 @@
-import { FunctionComponent, useState } from "/engine/component.js";
+import { h, FunctionComponent, useState } from "/engine/component.js";
 
-const h = (type, props, ...children) => ({ type, props, children });
 const queries = await fetch("/api/queries").then(response => response.json());
 const labels = { id: "기본 키로 한 행 조회", top: "조건 검색 후 상위 20행", rehash: "점진적 재해싱", ttl: "TTL 힙" };
 const engineLabs = {
@@ -231,4 +230,6 @@ function Lab() {
       : [Results({ result: view.result })]) : []));
 }
 
-new FunctionComponent(Lab, {}, document.querySelector("#lab")).mount();
+const root = document.querySelector("#lab");
+root.replaceChildren();
+new FunctionComponent(Lab, root).mount();

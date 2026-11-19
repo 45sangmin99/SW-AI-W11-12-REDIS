@@ -1,0 +1,615 @@
+{
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "engine": [
+    {
+      "mode": "before",
+      "repeat": 1,
+      "rows": [
+        {
+          "condition": "baseline",
+          "window_ms": 2001.282,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 0,
+          "p50_ms": 0.6734,
+          "p95_ms": 1.4796,
+          "p99_ms": 3.0643,
+          "max_ms": 14.0929
+        },
+        {
+          "condition": "rehash",
+          "window_ms": 2006.03,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1165,
+          "put_count": 600,
+          "put_latency": {
+            "p50_ms": 0.5065,
+            "p95_ms": 1.4356,
+            "p99_ms": 1.7301,
+            "max_ms": 5.2481
+          },
+          "injection_ms": 0,
+          "p50_ms": 0.5292,
+          "p95_ms": 1.0004,
+          "p99_ms": 1.481,
+          "max_ms": 4.5615
+        },
+        {
+          "condition": "append_delay",
+          "window_ms": 2005.036,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 365,
+          "put_count": 12,
+          "put_latency": {
+            "p50_ms": 58.9753,
+            "p95_ms": 63.5035,
+            "p99_ms": 63.5035,
+            "max_ms": 63.5035
+          },
+          "injection_ms": 50,
+          "p50_ms": 0.5892,
+          "p95_ms": 52.8782,
+          "p99_ms": 57.2116,
+          "max_ms": 63.4283
+        },
+        {
+          "condition": "fsync_delay",
+          "window_ms": 2001.908,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 1500,
+          "p50_ms": 0.6879,
+          "p95_ms": 1.6322,
+          "p99_ms": 3.0192,
+          "max_ms": 6.3365
+        }
+      ]
+    },
+    {
+      "mode": "integrated",
+      "repeat": 1,
+      "rows": [
+        {
+          "condition": "baseline",
+          "window_ms": 2005.141,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 0,
+          "p50_ms": 0.5643,
+          "p95_ms": 1.4037,
+          "p99_ms": 2.428,
+          "max_ms": 6.2558
+        },
+        {
+          "condition": "rehash",
+          "window_ms": 2005.03,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1253,
+          "put_count": 600,
+          "put_latency": {
+            "p50_ms": 0.52,
+            "p95_ms": 1.371,
+            "p99_ms": 1.6399,
+            "max_ms": 2.1615
+          },
+          "injection_ms": 0,
+          "p50_ms": 0.5088,
+          "p95_ms": 0.966,
+          "p99_ms": 1.52,
+          "max_ms": 3.4168
+        },
+        {
+          "condition": "append_delay",
+          "window_ms": 2004.279,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1056,
+          "put_count": 12,
+          "put_latency": {
+            "p50_ms": 55.056,
+            "p95_ms": 56.969,
+            "p99_ms": 56.969,
+            "max_ms": 56.969
+          },
+          "injection_ms": 50,
+          "p50_ms": 0.7088,
+          "p95_ms": 1.3952,
+          "p99_ms": 2.6002,
+          "max_ms": 12.0926
+        },
+        {
+          "condition": "fsync_delay",
+          "window_ms": 2003.413,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 1500,
+          "p50_ms": 0.6689,
+          "p95_ms": 1.5682,
+          "p99_ms": 2.7904,
+          "max_ms": 13.0545
+        }
+      ]
+    },
+    {
+      "mode": "integrated",
+      "repeat": 2,
+      "rows": [
+        {
+          "condition": "baseline",
+          "window_ms": 2005.034,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 0,
+          "p50_ms": 0.7538,
+          "p95_ms": 1.7769,
+          "p99_ms": 3.6624,
+          "max_ms": 7.7268
+        },
+        {
+          "condition": "rehash",
+          "window_ms": 2004.006,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1275,
+          "put_count": 600,
+          "put_latency": {
+            "p50_ms": 0.5262,
+            "p95_ms": 1.4373,
+            "p99_ms": 1.7011,
+            "max_ms": 1.9938
+          },
+          "injection_ms": 0,
+          "p50_ms": 0.5379,
+          "p95_ms": 1.0178,
+          "p99_ms": 1.2887,
+          "max_ms": 2.3146
+        },
+        {
+          "condition": "append_delay",
+          "window_ms": 2005.055,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1064,
+          "put_count": 12,
+          "put_latency": {
+            "p50_ms": 55.2582,
+            "p95_ms": 57.013,
+            "p99_ms": 57.013,
+            "max_ms": 57.013
+          },
+          "injection_ms": 50,
+          "p50_ms": 0.7147,
+          "p95_ms": 1.5407,
+          "p99_ms": 3.4322,
+          "max_ms": 5.8752
+        },
+        {
+          "condition": "fsync_delay",
+          "window_ms": 2002.883,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 1500,
+          "p50_ms": 0.7596,
+          "p95_ms": 1.41,
+          "p99_ms": 2.396,
+          "max_ms": 10.0384
+        }
+      ]
+    },
+    {
+      "mode": "before",
+      "repeat": 2,
+      "rows": [
+        {
+          "condition": "baseline",
+          "window_ms": 2004.622,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 0,
+          "p50_ms": 0.5322,
+          "p95_ms": 1.2405,
+          "p99_ms": 1.7886,
+          "max_ms": 11.5449
+        },
+        {
+          "condition": "rehash",
+          "window_ms": 2004.954,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1160,
+          "put_count": 600,
+          "put_latency": {
+            "p50_ms": 0.488,
+            "p95_ms": 1.3228,
+            "p99_ms": 1.4709,
+            "max_ms": 1.8907
+          },
+          "injection_ms": 0,
+          "p50_ms": 0.4933,
+          "p95_ms": 0.9517,
+          "p99_ms": 1.6063,
+          "max_ms": 6.491
+        },
+        {
+          "condition": "append_delay",
+          "window_ms": 2002.533,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 354,
+          "put_count": 12,
+          "put_latency": {
+            "p50_ms": 58.3944,
+            "p95_ms": 64.135,
+            "p99_ms": 64.135,
+            "max_ms": 64.135
+          },
+          "injection_ms": 50,
+          "p50_ms": 0.5666,
+          "p95_ms": 53.6901,
+          "p99_ms": 57.5508,
+          "max_ms": 65.046
+        },
+        {
+          "condition": "fsync_delay",
+          "window_ms": 2005.467,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 1500,
+          "p50_ms": 0.6781,
+          "p95_ms": 1.3731,
+          "p99_ms": 2.3716,
+          "max_ms": 5.3911
+        }
+      ]
+    },
+    {
+      "mode": "before",
+      "repeat": 3,
+      "rows": [
+        {
+          "condition": "baseline",
+          "window_ms": 2005.033,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 0,
+          "p50_ms": 0.7175,
+          "p95_ms": 1.5376,
+          "p99_ms": 3.4412,
+          "max_ms": 24.24
+        },
+        {
+          "condition": "rehash",
+          "window_ms": 2005.033,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1178,
+          "put_count": 600,
+          "put_latency": {
+            "p50_ms": 0.5048,
+            "p95_ms": 1.3457,
+            "p99_ms": 1.5275,
+            "max_ms": 2.017
+          },
+          "injection_ms": 0,
+          "p50_ms": 0.5125,
+          "p95_ms": 0.9843,
+          "p99_ms": 1.2371,
+          "max_ms": 2.266
+        },
+        {
+          "condition": "append_delay",
+          "window_ms": 2005.053,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 359,
+          "put_count": 12,
+          "put_latency": {
+            "p50_ms": 59.4929,
+            "p95_ms": 64.6097,
+            "p99_ms": 64.6097,
+            "max_ms": 64.6097
+          },
+          "injection_ms": 50,
+          "p50_ms": 0.5716,
+          "p95_ms": 54.1305,
+          "p99_ms": 57.5112,
+          "max_ms": 60.2355
+        },
+        {
+          "condition": "fsync_delay",
+          "window_ms": 2005.033,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 1500,
+          "p50_ms": 0.7941,
+          "p95_ms": 1.621,
+          "p99_ms": 3.3335,
+          "max_ms": 7.5393
+        }
+      ]
+    },
+    {
+      "mode": "integrated",
+      "repeat": 3,
+      "rows": [
+        {
+          "condition": "baseline",
+          "window_ms": 2004.836,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 0,
+          "p50_ms": 0.7478,
+          "p95_ms": 1.6236,
+          "p99_ms": 2.4252,
+          "max_ms": 5.371
+        },
+        {
+          "condition": "rehash",
+          "window_ms": 2003.579,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1181,
+          "put_count": 600,
+          "put_latency": {
+            "p50_ms": 0.5402,
+            "p95_ms": 1.4137,
+            "p99_ms": 1.7072,
+            "max_ms": 5.5599
+          },
+          "injection_ms": 0,
+          "p50_ms": 0.5296,
+          "p95_ms": 1.0336,
+          "p99_ms": 1.6674,
+          "max_ms": 3.6775
+        },
+        {
+          "condition": "append_delay",
+          "window_ms": 2005.03,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 1088,
+          "put_count": 12,
+          "put_latency": {
+            "p50_ms": 55.9649,
+            "p95_ms": 61.0245,
+            "p99_ms": 61.0245,
+            "max_ms": 61.0245
+          },
+          "injection_ms": 50,
+          "p50_ms": 0.7548,
+          "p95_ms": 1.8027,
+          "p99_ms": 3.2647,
+          "max_ms": 6.1342
+        },
+        {
+          "condition": "fsync_delay",
+          "window_ms": 2004.025,
+          "concurrency": 8,
+          "requests": 1600,
+          "failures": 0,
+          "gets_overlapping_put": 0,
+          "put_count": 0,
+          "put_latency": null,
+          "injection_ms": 1500,
+          "p50_ms": 0.7512,
+          "p95_ms": 1.6139,
+          "p99_ms": 3.4107,
+          "max_ms": 10.5527
+        }
+      ]
+    }
+  ],
+  "product": [
+    {
+      "group": "OFF",
+      "concurrency": 1,
+      "requests": 512,
+      "unique_keys": 512,
+      "failures": 0,
+      "origin": 512,
+      "hit": 0,
+      "miss": 0,
+      "rps": 7065.53,
+      "p50_ms": 0.1323,
+      "p95_ms": 0.1529,
+      "p99_ms": 0.1774,
+      "max_ms": 0.2468
+    },
+    {
+      "group": "MISS",
+      "concurrency": 1,
+      "requests": 512,
+      "unique_keys": 512,
+      "failures": 0,
+      "origin": 512,
+      "hit": 0,
+      "miss": 512,
+      "rps": 1959.59,
+      "p50_ms": 0.4152,
+      "p95_ms": 0.5437,
+      "p99_ms": 1.2792,
+      "max_ms": 19.2996
+    },
+    {
+      "group": "HIT",
+      "concurrency": 1,
+      "requests": 512,
+      "unique_keys": 512,
+      "failures": 0,
+      "origin": 0,
+      "hit": 512,
+      "miss": 0,
+      "rps": 3778.79,
+      "p50_ms": 0.2642,
+      "p95_ms": 0.293,
+      "p99_ms": 0.3119,
+      "max_ms": 0.3502
+    },
+    {
+      "group": "OFF",
+      "concurrency": 8,
+      "requests": 512,
+      "unique_keys": 512,
+      "failures": 0,
+      "origin": 512,
+      "hit": 0,
+      "miss": 0,
+      "rps": 11778.28,
+      "p50_ms": 0.4295,
+      "p95_ms": 1.1357,
+      "p99_ms": 1.7147,
+      "max_ms": 31.4845
+    },
+    {
+      "group": "MISS",
+      "concurrency": 8,
+      "requests": 512,
+      "unique_keys": 512,
+      "failures": 0,
+      "origin": 512,
+      "hit": 0,
+      "miss": 512,
+      "rps": 3328.55,
+      "p50_ms": 2.0307,
+      "p95_ms": 2.9497,
+      "p99_ms": 5.2603,
+      "max_ms": 73.5535
+    },
+    {
+      "group": "HIT",
+      "concurrency": 8,
+      "requests": 512,
+      "unique_keys": 512,
+      "failures": 0,
+      "origin": 0,
+      "hit": 512,
+      "miss": 0,
+      "rps": 5395.36,
+      "p50_ms": 1.1806,
+      "p95_ms": 2.0661,
+      "p99_ms": 2.7358,
+      "max_ms": 32.731
+    }
+  ],
+  "compiler": "Apple clang version 21.0.0",
+  "cpu": "Apple M2",
+  "flags": "clang++ -std=c++20 -O2 -g -pthread",
+  "before_revision": "c4f3b9e",
+  "after_base_revision": "b31823f",
+  "rehash": {
+    "repeats": 11,
+    "sizes": [
+      {
+        "nodes": 384,
+        "incremental": {
+          "peakNs": 84,
+          "totalNs": 7750
+        },
+        "allAtOnce": {
+          "peakNs": 5042,
+          "totalNs": 5084
+        }
+      },
+      {
+        "nodes": 49152,
+        "incremental": {
+          "peakNs": 208,
+          "totalNs": 930666
+        },
+        "allAtOnce": {
+          "peakNs": 658000,
+          "totalNs": 658042
+        }
+      }
+    ]
+  },
+  "ttl": {
+    "keys": 50000,
+    "ttlKeys": 2,
+    "repeats": 11,
+    "scan": {
+      "checks": 50000,
+      "ns": 37792
+    },
+    "heap": {
+      "checks": 1,
+      "ns": 41
+    }
+  },
+  "dbms_query_lab": {
+    "dbms_rows": 50000,
+    "direct_samples": 50,
+    "hit_samples": 50,
+    "first_miss_samples": 1,
+    "units": "ms",
+    "id": {
+      "direct_p50": 0.4360415,
+      "miss": 1.19625,
+      "hit_p50": 0.177021
+    },
+    "top": {
+      "direct_p50": 16.8732085,
+      "miss": 17.194209,
+      "hit_p50": 0.1934585
+    }
+  }
+}

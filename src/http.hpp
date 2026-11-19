@@ -140,6 +140,41 @@ class Json {
 
   public:
     explicit Json(const std::string &text) : s(text) {}
+    std::pair<std::string, int64_t> increment() {
+        expect('{');
+        bool event = false, delta = false;
+        std::string id;
+        int64_t amount = 0;
+        while (true) {
+            auto key = str();
+            expect(':');
+            if (key == "event_id" && !event) {
+                event = true;
+                id = str();
+            } else if (key == "delta" && !delta) {
+                delta = true;
+                ws();
+                size_t begin = i;
+                while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+                    ++i;
+                auto r = std::from_chars(s.data() + begin, s.data() + i, amount);
+                if (r.ec != std::errc() || amount <= 0 ||
+                    (i - begin > 1 && s[begin] == '0'))
+                    throw HttpError(400, "delta must be a positive int64");
+            } else
+                throw HttpError(400, "unknown or duplicate field");
+            ws();
+            if (i < s.size() && s[i] == '}') {
+                ++i;
+                break;
+            }
+            expect(',');
+        }
+        ws();
+        if (i != s.size() || !event || !delta)
+            throw HttpError(400, "event_id and delta required");
+        return {id, amount};
+    }
     std::pair<std::string, int64_t> parse() {
         expect('{');
         bool value = false, ttl = false;
@@ -276,7 +311,7 @@ inline std::optional<Request> request(std::string &input) {
             if (z.ec != std::errc() || z.ptr != v.data() + v.size())
                 throw HttpError(400, "length");
         }
-        if (name == "content-type" && r.method == "PUT" && lower(v) != "application/json" &&
+        if (name == "content-type" && (r.method == "PUT" || r.method == "POST") && lower(v) != "application/json" &&
             lower(v) != "application/json; charset=utf-8")
             throw HttpError(415, "JSON content type required");
         if (name == "transfer-encoding")

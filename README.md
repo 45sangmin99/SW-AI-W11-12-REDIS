@@ -1,264 +1,207 @@
-# Mini Redis — C++20 / HTTP / AOF
+# MINI REDIS
 
-직접 만든 chaining hash table과 indexed TTL heap을 사용하는 단일 프로세스 저장소다. 핵심 서버는 C++20/POSIX이며 외부 라이브러리가 없다. Python 표준 라이브러리로 실제 HTTP 통합 테스트, 별도 상품 API, 벤치마크를 제공한다. 구현·검증 환경은 **macOS ARM64**다. Linux용 POSIX API를 사용했지만 Linux 실행 검증은 수행하지 않았다.
+## 개요
+
+C++20으로 구현한 학습용 인메모리 키-값 저장소입니다.
+
+문자열 저장과 조회, TTL, 장애 복구를 HTTP로 제공하며, 캐시 서버가 여러 요청과 디스크 쓰기를 함께 처리하는 과정을 직접 구현했습니다.
+
+## 설계 목표
+
+메모리에 값을 들고 있으면 빠르게 읽을 수 있습니다. 여러 연결이 같은 값을 바꾸거나, 값을 저장하는 중 프로세스가 종료되면 어느 상태까지 관측하고 되살릴 수 있는지는 따로 정해야 합니다.
+
+- 한 연결이 느리거나 저장 작업이 진행 중이어도 다른 연결에서 이미 반영된 값을 조회할 수 있도록 했습니다.
+- 조회 시 이미 만료된 값을 숨기고, 재시작 후에도 원래 만료 시각을 유지하도록 했습니다.
+- 일반 캐시 쓰기와 영구 카운터의 성공 응답이 각각 어디까지 완료됐음을 뜻하는지 구분했습니다.
+
+## 특징
+
+### 1. `poll()` 기반 단일 명령 실행
+
+- 여러 HTTP 연결의 요청을 하나의 이벤트 루프에서 처리합니다.
+- 같은 연결의 응답 순서를 유지하며, 키 공간은 이벤트 루프에서만 수정합니다.
+
+#### 도입 이유
+
+- 한 클라이언트가 본문을 늦게 보내거나 큰 응답을 읽지 않아도 다른 연결은 진행할 수 있어야 했습니다.
+- 여러 요청이 같은 키를 갱신해도 조회 결과에는 한 쓰기의 완성된 값만 나타나야 했습니다.
+
+#### 적용 방식
+
+- 소켓은 non-blocking으로 처리하고, 연결별 읽기·쓰기와 한 루프에서 실행하는 명령 수에 한도를 둡니다.
+- AOF 파일 처리는 별도 스레드에 맡깁니다. 기록 중에는 다른 연결이 마지막으로 반영된 유효한 값을 읽고, 기록이 끝나면 이벤트 루프가 변경을 반영합니다.
+
+### 2. 점진적 재해싱
+
+- 키 공간은 FNV-1a와 separate chaining으로 구현했습니다.
+- 재해싱 중에는 이전 버킷 배열과 새 배열을 함께 관리합니다.
+
+#### 도입 이유
+
+- 버킷이 확장될 때 모든 키를 한꺼번에 옮기면 그동안 같은 이벤트 루프의 조회도 기다려야 합니다.
+
+#### 적용 방식
+
+- 다음 삽입으로 로드 팩터가 0.75를 넘으면 버킷 배열을 두 배로 늘립니다.
+- 한 재배치 단계에서 노드 최대 4개와 버킷 최대 8개만 처리합니다. 신규 키는 새 배열에 저장하고, 기존 키는 두 배열에서 찾습니다.
+- 노드의 주소를 유지해 TTL 힙의 참조를 보존합니다. 새 버킷 배열을 준비하는 작업은 한 번에 수행합니다.
+
+### 3. 인덱스를 가진 TTL 최소 힙
+
+- TTL이 있는 키만 최소 힙에 넣고, 만료 시각이 가장 빠른 키를 맨 위에 둡니다.
+- 키가 자신의 힙 위치를 기억하므로 TTL을 바꾸거나 삭제할 때 해당 항목을 `O(log n)`에 조정합니다.
+
+#### 도입 이유
+
+- TTL이 설정된 키가 적어도 전체 키를 훑는 방식은 만료 대상을 찾을 때마다 저장소 크기만큼 비용이 듭니다.
+- 이벤트 루프가 아직 정리하지 않았더라도 요청 시점에 이미 만료된 값은 반환할 수 없습니다.
+
+#### 적용 방식
+
+- 조회할 때 만료 여부를 직접 확인합니다. 이벤트 루프도 힙 맨 위부터 한 번에 최대 64개의 만료 키를 정리합니다.
+- AOF에는 상대 TTL 대신 Unix epoch 밀리초로 계산한 만료 시각을 기록합니다. 재시작해도 입력받았던 TTL부터 다시 세지 않습니다.
+
+### 4. AOF로 쓰기 복구
+
+- PUT·DELETE의 전체 레코드를 AOF에 쓴 뒤 메모리에 반영하고 `204`를 응답합니다.
+- 별도 스레드가 새 기록이 있을 때 약 1초 주기로 `fsync`합니다.
+
+#### 도입 이유
+
+- 프로세스가 종료된 뒤에도 기록된 변경을 순서대로 적용할 수 있어야 했습니다.
+- 기록 도중 종료된 마지막 레코드와 파일 중간에서 손상된 레코드는 서로 다른 오류로 처리해야 합니다.
+
+#### 적용 방식
+
+- 레코드에 길이, 순번, 동작, 만료 시각과 체크섬을 담습니다. 시작할 때 유효한 레코드를 차례로 적용하고, 마지막 레코드가 쓰이는 도중 끊겼으면 마지막 정상 위치까지 자릅니다.
+- 완전한 레코드의 체크섬 오류나 중간 손상은 시작 실패로 처리합니다. AOF 쓰기 또는 동기화가 실패하면 이후 변경을 차단합니다.
+- 일반 키의 `204`는 append와 메모리 반영 완료를 뜻합니다. 전원 장애 등으로 아직 동기화되지 않은 로그가 사라지면 성공 응답을 받은 쓰기도 유실될 수 있습니다.
+
+### 5. 중복 없는 영구 카운터
+
+- 같은 `event_id`를 재전달해도 카운터 값은 한 번만 증가합니다. 같은 ID를 다른 키나 증가량에 사용하면 `409`를 반환합니다.
+- 카운터와 처리한 ID를 단일 AOF 레코드로 남기고, `fsync`가 성공한 뒤 두 값을 반영하고 `200`을 응답합니다.
+- 일반 조회는 이 동기화 중에도 처리합니다. 카운터와 ID는 TTL 없이 보관하므로 보관량은 계속 증가할 수 있습니다.
+
+## 지원 HTTP API
+
+| 동작 | 요청 | 성공 | 없는 키 |
+|---|---|---|---|
+| 문자열 저장 | `PUT /keys/{key}` | `204` | 새 키를 생성 |
+| 문자열 조회 | `GET /keys/{key}` | `200`, `value` | `404` |
+| TTL 조회 | `GET /keys/{key}/ttl` | `200`, `ttl_seconds` | `404` |
+| 삭제 | `DELETE /keys/{key}` | `204` | `404` |
+| 카운터 조회 | `GET /counters/{key}` | `200`, `value` | `404` |
+| 중복 없는 증가 | `POST /counters/{key}/incrbyonce` | `200`, `value`와 `applied` | 새 카운터를 생성 |
+
+`value`는 문자열이고, PUT의 `ttl_seconds`는 생략하거나 양의 정수로 지정합니다. TTL 없이 덮어쓰면 기존 TTL이 해제됩니다. 카운터 증가 요청은 64자리 소문자 16진수 `event_id`와 양의 정수 `delta`를 받습니다. [HTTP 규칙과 복구 동작](docs/protocol-and-recovery.md)
 
 ## 빌드와 실행
 
-C++20 컴파일러, CMake 3.16 이상, Python 3, POSIX 환경이 필요하다.
-
-```sh
-cmake -S . -B build/cmake -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cmake -j2
-ctest --test-dir build/cmake --output-on-failure
-
-mkdir -p data
-./build/cmake/mini-redis --host 127.0.0.1 --port 6380 --aof-path ./data/appendonly.aof
-# 다른 터미널
-python3 example/product_api.py --port 8080 --redis-port 6380 --ttl 60
-```
-
-SIGINT(Ctrl-C)/SIGTERM은 시그널 플래그만 설정한다. 이벤트 루프 종료 후 연결을 정리하고, fsync 스레드가 마지막 동기화를 시도한 뒤 join하며 AOF fd를 닫는다. 종료 중 미처 응답하지 못한 명령은 실행됐을 수 있다. `shutdown appended=... synced=...` 로그는 **destructor의 최종 fsync 이전** 스냅샷이다. 최종 동기화 완료는 시험 이벤트 `sync_done`으로 확인한다.
-
-현재 호스트에는 CMake가 없었으므로 `build/tools`의 격리된 Python 가상환경에 CMake 4.4.5와 clang-format을 설치해 CTest를 실제 실행했다. 시스템 Python 패키지는 변경하지 않았다. 이 환경에서는 `cmake`/`ctest` 대신 `build/tools/bin/cmake`/`build/tools/bin/ctest`를 사용할 수 있다. 실행 서버의 패키지 의존성은 없다. CMake 없이도 다음 명령이 동작한다.
+C++20 컴파일러, POSIX 환경, Make, Python 3이 필요합니다. CMake 3.16 이상을 사용할 수도 있습니다.
 
 ```sh
 make -j2
 make test
-make benchmark
+mkdir -p data
+./build/mini-redis --port 6380 --aof-path ./data/appendonly.aof
 ```
-
-`make`는 `build/mini-redis`, `build/unit-tests`를 생성한다. `make benchmark`는 `build/engine-bench`도 생성한다. `make sanitize`는 Make 산출물을 sanitizer 버전으로 덮어쓴다. 벤치마크 전에 `make -B all build/engine-bench`로 최적화 빌드를 복구해야 한다. 별도 sanitizer 빌드가 권장된다.
-
-```sh
-cmake -S . -B build/sanitize -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=ON
-cmake --build build/sanitize -j2
-ctest --test-dir build/sanitize --output-on-failure
-```
-
-## 공개 HTTP 계약
 
 ```sh
 curl -i -X PUT http://127.0.0.1:6380/keys/keyboard \
   -H 'Content-Type: application/json' \
   --data-binary '{"value":"keyboard","ttl_seconds":60}'
-# 204, 본문 없음
 curl -i http://127.0.0.1:6380/keys/keyboard
-# 200 {"value":"keyboard"}
 curl -i http://127.0.0.1:6380/keys/keyboard/ttl
-# 200 {"ttl_seconds":60} (실제 남은 시간에 따라 감소)
 curl -i -X DELETE http://127.0.0.1:6380/keys/keyboard
-# 204, 본문 없음
-curl -i http://127.0.0.1:6380/keys/keyboard
-# 404 {"error":"key not found"}
 ```
 
-| 동작 | 성공 | 없는/만료된 키 |
-|---|---|---|
-| `PUT /keys/{key}` | 204 | 생성 가능 |
-| `GET /keys/{key}` | 200 `{"value":"..."}` | 404 |
-| `GET /keys/{key}/ttl` | 200 `{"ttl_seconds":정수 또는 null}` | 404 |
-| `DELETE /keys/{key}` | 204 | 404 |
+기본 주소는 `127.0.0.1:6380`이며, `Ctrl-C`로 종료합니다. 같은 AOF 경로로 재실행하면 기록을 복구합니다. 인증과 TLS는 지원하지 않습니다.
 
-`value`는 필수 JSON 문자열이며 빈 문자열도 값이다. TTL은 생략 가능한 양의 JSON 정수다. 0·음수·소수·지수 표기·문자열·null·bool·정수/만료 시각 오버플로는 400이다. 중복/알 수 없는 필드, trailing comma, 잘못된 UTF-8/Unicode escape/짝 없는 surrogate도 400이다. TTL 생략 덮어쓰기는 기존 TTL을 제거한다. TTL은 남은 양의 ms를 초로 올림하며 만료 시각과 같아지는 순간 404다.
+## 예제
 
-경로 segment를 **먼저 분리하고 한 번만** percent-decode한다. `a/ttl` 키는 `/keys/a%2Fttl`, 이 키의 TTL은 `/keys/a%2Fttl/ttl`이다. `+`는 그대로 `+`다. 빈 키, 512바이트 초과, 잘못된 encoding, ASCII/C1 제어문자와 유효하지 않은 UTF-8 키를 거부한다. 쿼리/fragment는 지원하지 않으며 필요한 문자 자체는 percent-encode한다. 공개 명령 추가, RESP/redis-cli 호환은 없다.
-
-잘못된 요청은 `{"error":"..."}` 형태다. 미지원 메서드 405, 경로 없음 404, JSON/HTTP 구문 오류 400, 명시한 Content-Type이 JSON이 아니면 415, 본문 초과 413, 헤더 초과 431, Expect 미지원 417, 쓰기/자원 실패 503이다. Content-Type 생략은 허용한다. JSON은 `application/json` 또는 `application/json; charset=utf-8`을 받는다. 상세 저장 장치 오류는 stderr에 기록한다. 204 응답 본문은 비어 있다.
-
-## 구조와 스레드
-
-| 파일 | 책임 |
-|---|---|
-| `src/engine.hpp` | 키/값 소유, FNV-1a, chaining, 점진적 재배치, indexed heap, validate |
-| `src/aof.hpp` | 바이너리 레코드, 잠금, replay/repair, 백그라운드 append와 fsync |
-| `src/http.hpp`, `src/text.hpp` | 스트리밍 HTTP/엄격한 JSON/UTF-8 검증과 직렬화 |
-| `src/main.cpp` | CLI, 소켓 RAII, poll 연결 루프, HTTP→명령 매핑 |
-| `tests/` | 단위/실제 프로세스 통합/실패 주입 및 실행 결과 |
-| `example/` | 한 번 로드한 상품 데이터와 별도 HTTP API |
-| `benchmarks/` | 재현 스크립트, 직접 GET 측정, 관측 결과/타임라인 |
-
-키 공간은 이벤트 루프만 수정한다. AOF 스레드는 로그를 쓰고 동기화하며, 완료를 파이프로 알려 `poll()`을 깨운다. 변경 명령은 한 건씩 처리한다. 대기 중인 연결은 후속 명령을 실행하지 않으며, 다른 연결의 GET은 마지막으로 반영된 유효한 값을 읽는다. 다른 연결에 대기 중인 변경이 있으면 연결당 요청 하나를 보류해 응답 순서를 유지한다. DELETE 204 완료 후 새 PUT 없이 시작한 GET은 404다.
-
-리스닝/연결 소켓은 non-blocking이고 poll()을 사용한다. 부분 recv/send, 연속 요청, Keep-Alive와 pipeline을 지원하며 같은 연결 응답은 FIFO다. 매 연결 read/write는 반복당 각각 최대 64KiB, 명령은 연결당 4개/전체 64개, accept는 16개다. 연결 처리 시작점을 회전한다. TTL active 정리는 반복당 64개다. 기본 poll 대기는 10ms다.
-
-동일 Content-Length 중복도 보수적으로 400으로 거부한다. Transfer-Encoding은 chunked를 포함해 전부 거부한다. Host가 필수다. framing 오류는 그 연결에 오류 응답 후 닫는다. 짧은 본문은 추가 바이트를 기다리며, write-half-close로 부족함이 확정되면 400, 유휴 타임아웃이면 연결을 닫는다. 클라이언트가 선언한 길이보다 뒤에 보낸 바이트는 HTTP/1.1의 다음 요청으로 해석한다. 이 경우 임의로 길이를 추정하지 않는다.
-
-기본 한도는 헤더 16KiB, 본문 1MiB, 누적 입력 1,100,000바이트, 연결 256개, 무활동 10초다. 출력 2MiB 도달 시 추가 읽기/명령 실행을 멈추므로, 마지막 단일 응답까지 포함하면 약 3.1MiB 미만의 문자열이 연결별로 대기할 수 있다(allocator capacity 제외). 연결 한도를 넘으면 새 연결을 닫는다. 느린 수신자에게 다른 연결의 진행을 맡기지 않는다. 전체 프로세스 RSS 제한은 제공하지 않는다.
-
-CLI: `--host`(IPv4, 기본 127.0.0.1), `--port`(6380), `--aof-path`(appendonly.aof), `--memory-limit`(67108864), `--max-connections`(256), `--idle-seconds`(10). 메모리 한도는 **엔트리 구조체+키+값 논리 바이트**의 한도이며 버킷/heap capacity/문자열 여유 용량/네트워크 버퍼/AOF 임시 문자열은 포함하지 않는다. 이 한도 초과 시 데이터를 축출하지 않고 PUT을 503으로 거부한다. 배열/노드 실제 할당 실패도 성공으로 처리하지 않는다. 불변식 오류/복구 불가능 예외는 fail-stop 처리한다.
-
-인증/TLS는 없다. 기본은 loopback이며, 외부 바인딩은 신뢰할 수 있는 환경에서만 명시적으로 선택해야 한다. 소켓과 영속화의 POSIX 코드는 각각 main/aof 모듈에 모여 있다. Windows는 지원하지 않는다.
-
-## 해시 테이블과 TTL
-
-FNV-1a 64비트를 직접 구현했다. 최초 버킷은 4개이며 2의 거듭제곱이다. `hash & (size-1)`로 버킷을 고르고 체인에서 전체 키를 비교한다. UPDATE는 기존 엔트리를 갱신하고 DELETE는 해당 노드만 제거한다. `std::map`/`unordered_map`으로 키 공간을 대신하지 않는다. `unordered_set`은 hot path 밖의 validate에서만 쓴다.
-
-다음 삽입의 load factor가 0.75를 넘으면 두 배 배열을 미리 준비한다. 신규 삽입은 새 배열에 넣고 조회/삭제는 두 배열을 확인한다. 한 step은 **최대 4노드 이동/8버킷 전진**으로 제한된다. 긴 충돌 체인도 한 번에 전부 이동하지 않는다. 노드 주소는 그대로이고 TTL heap의 포인터도 그대로 유지된다. 완료하면 이전 배열을 해제한다. 재배치 중에는 추가 확장을 시작하지 않고 완료 후 다음 PUT 준비에서 필요 시 확장한다.
-
-새 버킷 배열 할당/초기화와 heap capacity 증가 자체는 동기 작업이다. 노드 이동 예산이 모든 PUT 시간을 엄격히 제한하는 것은 아니다. 시작/완료 횟수, old/new 배열 크기, 이동 노드/전진 버킷 수, step의 최대 노드/스캔/시간을 stderr와 내부 카운터로 관측한다. 단계 완료 로그가 다음 루프에서 나와 시작과 완료가 한 로그에 함께 보일 수도 있다.
-
-validate는 실제 노드 수/바이트 수, 올바른 버킷, 키 중복, 엔트리와 heap의 양방향 일치, heap 순서를 검사한다. 복구 완료 후 listen 이전과 정상 종료 시 실행하며 hot path에서 매번 호출하지 않는다. 단위 무작위 검사에서는 주기적으로 실행한다.
-
-TTL은 Unix epoch ms 절대 시각이다. TTL 없는 엔트리는 heap에 없다. 엔트리는 heap index를 보유하고 heap은 안정적인 엔트리 포인터를 보유한다. 갱신/제거는 O(log n), key lookup은 해시 테이블을 사용한다. TTL 재설정/해제/삭제/재생성 시 오래된 예약을 남기지 않는다. Passive expiration은 키 접근 때 항상 확인하고, active expiration은 heap root부터 예산 내에서 지운다. 만료 DEL은 AOF에 따로 쓰지 않는다.
-
-AOF 완료를 기다리는 갱신이나 삭제가 기존 엔트리를 참조하면, 해당 엔트리는 완료까지 해제하지 않는다. 만료된 값은 조회에서 숨기며, 해당 엔트리가 heap root에 있으면 그 뒤의 active 정리도 완료까지 밀릴 수 있다.
-
-테스트에 시계를 주입해 만료 1ms 전/정확한 경계/동시 만료/정리 예산을 sleep 없이 확인하고, 1200ms→2초/100ms→1초 및 큰 정수의 올림을 단위 검사했다. HTTP 테스트는 실제 경과도 확인한다. 벽시계가 뒤로 이동하면 아직 제거되지 않은 키의 실제 수명이 길어질 수 있고, 앞으로 뛰면 즉시 만료될 수 있다. 이미 제거한 엔트리는 시계가 돌아와도 현재 프로세스에서 복구하지 않는다. AOF가 절대 시각을 보유하므로 벽시계 역행 후 재시작에서는 이전 만료 PUT이 다시 유효하게 해석될 여지가 있다. monotonic TTL로 의미를 바꾸지 않았으며 시계 동기화가 운영 전제다.
-
-## AOF와 성공 응답의 의미
-
-PUT은 JSON/TTL/논리 한도 검사 → 문자열·노드·heap capacity·필요한 버킷 배열 준비 → 레코드 문자열 준비 → 전체 append → 예외 없는 메모리 commit → 204 순서다. UPDATE commit은 문자열 swap과 heap/pointer 연산만 한다. DELETE도 엔트리 확인 → append → 해당 포인터 제거 → 204다. 없는/만료된 키 DELETE는 404이며 DEL 레코드를 추가하지 않는다. 실제 allocator 실패 주입과 commit 중 allocator 차단으로 이 경계를 검사했다.
-
-레코드는 고정 폭 **little endian**이다. `MRD1`이 버전 1을 나타낸다.
-
-| 오프셋 | 크기 | 필드 |
-|---|---|---|
-| 0 | 4 | ASCII `MRD1` |
-| 4 | 4 | 레코드 전체 바이트 수 = 41+key_length+value_length |
-| 8 | 4 | 헤더 CRC32: bytes [0,8)+[12,37) |
-| 12 | 8 | sequence (1부터 연속) |
-| 20 | 1 | `P` PUT / `D` DELETE |
-| 21 | 8 | epoch ms 만료 시각 (0은 무기한) |
-| 29 | 4 | key_length |
-| 33 | 4 | value_length (DELETE는 0) |
-| 37 | 가변 | key, value 바이트 |
-| 끝-4 | 4 | 앞의 전체 레코드에 대한 CRC32 |
-
-CRC32는 표준 IEEE 다항식 0xEDB88320이다. 레코드 최대 1,100,000바이트, 키 최대 512바이트, 값 최대 1MiB다. 헤더 자체 CRC가 길이 필드 손상을 검출하므로 중간 길이 손상을 잘린 꼬리로 오인해 지우지 않는다. CRC는 악의적 변조를 인증하지 않는다.
-
-append는 EINTR/짧은 write를 반복하며 전체 레코드 성공 후에만 `appended_seq`를 게시한다. I/O 실패 시 해당 변경을 메모리에 반영하지 않고 이후 변경을 차단한다. 부분 레코드는 남을 수 있으며 다음 시작에서 규칙에 맞는 꼬리만 절단한다. 읽기/TTL은 계속 제공한다. 성공한 append는 연결이 끊겨도 반영한다. append 성공 후 메모리 반영 시점에 fsync 실패를 관측하면 503을 보낼 수 있다. **실패 응답이나 끊긴 연결은 rollback을 뜻하지 않는다.** 이 API는 exactly-once 요청 식별을 제공하지 않는다.
-
-백그라운드 스레드는 약 1초 주기로 dirty 여부를 확인하고, 새 append가 있을 때만 `fsync(fd)`를 실행한다. 같은 스레드에서 두 I/O를 직렬화하므로 fsync 도중 제출된 append는 동기화가 끝난 뒤 실행된다. 그동안 GET/TTL을 계속 처리한다. fsync 실패는 stderr/시험 이벤트/이후 변경 요청 503으로 드러난다.
-
-시작 시 flock(LOCK_EX|LOCK_NB) → 파일 크기/각 헤더·레코드 CRC/길이·type·sequence·텍스트·만료 의미 검사 → 동일 keyspace 변경 경로로 replay → 복구 파일 fsync/워터마크 초기화 → 만료 제거/validate → 부모 디렉터리 fsync → listen 순서다. 복구된 완전한 레코드도 시작 시 fsync한 다음 synced watermark를 설정한다. 같은 AOF 파일을 두 프로세스가 동시에 소유할 수 없다. 잠금은 같은 inode를 대상으로 하므로 운영 중 AOF를 외부에서 교체/수정/삭제해서는 안 된다.
-
-끝의 잘린 헤더(올바른 magic prefix/가능한 길이) 또는 유효한 헤더 뒤 부족한 본문만 마지막 완전 오프셋으로 ftruncate하고 fsync한다. 완전 레코드 CRC 오류, 헤더 CRC 오류, 불가능한 명령/길이/sequence는 시작 실패다. 손상 로그를 빈 파일로 초기화하지 않는다. ftruncate 직후/fsync 전에 SIGKILL 후 재시작하는 idempotence도 검증했다. CRC로도 구분할 수 없는 일부 짧은 마지막 헤더 prefix 손상은 잘린 꼬리와 구별할 수 없다.
-
-**204는 append+메모리 반영 성공이며 해당 쓰기의 fsync 완료를 의미하지 않는다.** 전원/OS/저장 장치 장애로 미동기화 append가 사라지면 이미 204를 받은 쓰기도 유실될 수 있다. 1초는 호출 주기이며 데이터 손실 시간의 엄격한 상한이 아니다. 지연 주입 시 주기는 완료 후 다음 1초를 기다리므로 더 길어진다. SIGKILL은 OS 페이지 캐시를 지우지 않는다. 이번 검증은 실제 프로세스 강제 종료이며 전원 장애 재현이 아니다. macOS에서도 요청된 fsync를 사용하며 F_FULLFSYNC나 저장 장치 내부 캐시/하드웨어 보장은 검증하지 않았다.
-
-## 상품 API
-
-실제 Mini DBMS와 비교하려면 [Redis / DBMS 조회 실습](example/query-lab/README.md)을 실행하세요. 기본 키 조회와 조건 검색·정렬 쿼리의 직접 조회, Redis MISS, Redis HIT를 Mini React 화면에서 비교합니다.
-
-`example/products.json`을 시작 시 한 번 파싱해 메모리에 저장한다. `lookup_product()` 하나가 원본 조회와 카운터 증가를 담당한다. 요청마다 파일을 다시 읽지 않는다.
+- **상품 API**는 상품 파일을 시작할 때 한 번 읽습니다. `cache=off`는 메모리 원본을 조회하고, `cache=on`은 Redis MISS에서만 원본을 조회한 뒤 TTL을 설정합니다. 응답 본문은 같고 `X-Data-Source`로 출처를 확인합니다.
+- **Redis / DBMS 조회 실습**은 같은 SQL의 DBMS 직접 조회, 첫 MISS, 이후 HIT를 비교합니다. 재해싱과 TTL 힙도 화면에서 실행할 수 있습니다. [조회 실습 실행법](example/query-lab/README.md)
 
 ```sh
-curl -i 'http://127.0.0.1:8080/products/1001?cache=off'
+python3 example/product_api.py --port 8080 --redis-port 6380 --ttl 60
 curl -i 'http://127.0.0.1:8080/products/1001?cache=on'
-curl -s http://127.0.0.1:8080/stats
-curl -i -X DELETE http://127.0.0.1:6380/keys/product%3A1001
 ```
 
-OFF는 Mini Redis를 전혀 호출하지 않는다. ON은 `GET product:1001` → HIT이면 저장된 상품 문자열을 JSON으로 읽어 반환 → 404 MISS이면 원본 조회 후 `PUT+TTL`하고 반환한다. 본문은 OFF/ON이 동일하고 `X-Data-Source: origin|redis`로 출처만 구별한다. `/stats`는 origin/hit/miss/error 누계다. 서버 재시작으로 통계를 초기화하며 벤치마크는 전후 차이를 사용한다. Redis 연결 실패/5xx/잘못된 캐시 값은 404로 간주하지 않고 502다.
+## 성능 비교
 
-예제 API는 Python ThreadingHTTPServer이며 동시 원본 조회 counter는 락으로 보호한다. 같은 키의 동시 MISS를 합치는 single-flight는 없다. 이런 경우 여러 번 원본을 조회할 수 있다. 주 벤치마크는 서로 다른 512개 키를 각 1회 사용하는 분포라 같은 키의 중복 원본 호출이 발생하지 않는 조건이다.
+### 1. AOF 기록을 별도 스레드로 이동
 
-## 검증 실행과 결과
+- 이전 버전은 이벤트 루프에서 AOF에 직접 기록했습니다. 기록이 늦어지면 다른 연결의 GET도 함께 밀렸습니다.
+- 통합 버전은 AOF 스레드가 append를 완료한 뒤 이벤트 루프가 메모리에 반영합니다. 기록 중에도 다른 연결의 GET은 처리합니다.
+- 두 버전에서 50ms의 append 지연을 주입하고, GET 1,600회와 PUT 12회를 겹쳐 실행했습니다. 기존 버전은 `c4f3b9e`입니다.
+
+### 2. 점진적 재해싱과 TTL 힙
+
+- 재해싱은 같은 키 49,152개를 옮기면서 한 단계에 걸린 최대 시간과 전체 이동 시간을 비교했습니다. 점진적 방식은 가장 긴 단계를 줄였고, 전체 이동에 걸린 시간은 더 길었습니다.
+- TTL은 키 50,000개 중 2개에만 만료 시각을 두고, 전체 순회와 힙 맨 위 조회가 같은 키를 찾는지 확인했습니다.
+
+### 성능 측정 결과
+
+| 최적화 | 측정 항목 | 변경 전 | 변경 후 |
+|---|---|---:|---:|
+| 백그라운드 append | GET p95, 50ms 기록 지연 | 53.6901ms | 1.5407ms |
+| 백그라운드 append | GET p99, 50ms 기록 지연 | 57.5112ms | 3.2647ms |
+| 백그라운드 append | PUT p95, 50ms 기록 지연 | 64.1350ms | 57.0130ms |
+| 점진적 재해싱 | 한 단계 최대 이동 시간 | 658.000µs | 0.208µs |
+| 점진적 재해싱 | 전체 이동 시간 | 658.042µs | 930.666µs |
+| TTL 힙 | 다음 만료 키를 찾기 위해 확인한 키 | 50,000개 | 1개 |
+| TTL 힙 | 다음 만료 키 탐색 시간 | 37.792µs | 0.041µs |
+
+#### 측정 조건
+
+- Apple M2, macOS ARM64, Apple Clang 21.0.0, C++20 `-O2`. HTTP는 같은 기기의 loopback으로 호출했습니다.
+- append 비교는 각 버전을 3회 실행한 분위수의 중앙값입니다. GET 8개 연결로 각각 200회 요청했습니다. 50ms는 실험용으로 넣은 지연입니다.
+- 재해싱과 TTL 힙은 엔진에서 직접 11회 측정한 중앙값입니다. 재해싱은 새 버킷 배열 준비·HTTP·AOF 시간을 제외했고, TTL 비교는 다음 대상 찾기만 측정했습니다.
+
+### 3. 원본 조회와 캐시 조회
+
+| 원본 | 비교 구간 | 원본 직접 조회 p50 | MISS | HIT p50 |
+|---|---|---:|---:|---:|
+| Mini DBMS | 기본 키 한 행 | 0.436ms | 1.196ms | 0.177ms |
+| Mini DBMS | 조건 검색 후 정렬, 상위 20행 | 16.873ms | 17.194ms | 0.193ms |
+| 메모리 상품 목록 | 단일 클라이언트 | 0.132ms | 0.415ms | 0.264ms |
+
+DBMS는 캐릭터 50,000행에서 조건별 한 번 실행했습니다. 워밍업 후 첫 MISS 1회, 직접 조회와 HIT는 각 50회였습니다. 직접 조회 50건은 DBMS를 50번 호출했고, MISS 1건은 1번, HIT 50건은 0번 호출했습니다. DBMS 표의 MISS는 첫 요청 한 번이며, 상품 API 표의 MISS는 서로 다른 상품 512건을 요청한 p50입니다. 상품 원본은 이미 메모리에 있어, 이 경우 Redis HTTP 호출이 추가되는 HIT가 더 느렸습니다. [전체 측정 요약](benchmarks/integration-results.json) · [조회 실습 측정 방식](example/query-lab/README.md#측정-방식)
+
+## 검증과 재현
 
 ```sh
-./build/unit-tests
-python3 tests/integration.py ./build/mini-redis
-python3 benchmarks/run.py ./build/mini-redis
-./build/engine-bench
+make test
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
+cmake --build build/release -j2
+ctest --test-dir build/release --output-on-failure
+
+cmake -S . -B build/sanitize -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=ON
+cmake --build build/sanitize -j2
+ctest --test-dir build/sanitize --output-on-failure
 ```
 
-마지막 Make 검사: 단위 바이너리 1개 통과, 실제 서버 통합 **12개 그룹 통과/실패 0**. CTest Release **2/2 통과**, ASan+UBSan Debug **2/2 통과**이며 ASan/UBSan 진단은 없었다. unit은 40,000회 seeded 무작위 연산을 참조 unordered_map과 대조하고 충돌/여러 확장/heap·TTL/경계/실제 allocator 실패/할당 없는 commit을 검사한다. CTest의 integration 하나 안에서 다음 12개 그룹을 실행한다. 실제 실행 로그는 `tests/make-results.txt`, `tests/release-results.txt`, `tests/sanitizer-results.txt`에 있다. 기본 6380/8080 포트에서도 curl로 네 명령과 상품 OFF/MISS/HIT를 실행했으며 원문 응답은 `tests/curl-results.txt`에 있다.
-
-| 그룹 | 실제 검증 |
+| 검사 | 통합 결과 |
 |---|---|
-| `http_contract` | 204/200/404, 빈 값/escape, TTL/해제, 잘못된 JSON·경로·TTL, 실패 시 AOF 불변 |
-| `streaming_keepalive_isolation` | 3바이트 분할, 10개 pipeline FIFO, 길이 충돌/chunked 거부, half-close, 느린 본문/유휴 격리 |
-| `backpressure_connection_limits` | 큰 응답을 안 읽는 연결과 정상 GET 공존, 과대 헤더, 최대 연결 초과 거부 |
-| `concurrent_linearization` | barrier로 8 writers+8 readers 겹침, PUT 160회/GET 480회 완전 값, DELETE 후 GET 80회 모두 404 |
-| `recovery_sigkill_tail_corruption_lock` | sync 완료 후 SIGKILL/재시작, DEL/TTL 비연장·다운 중 만료, tail repair+추가 PUT+재시작, 본문·길이 손상 거부, 중복 소유 거부 |
-| `interrupted_tail_repair` | ftruncate 직후 fsync 전 강제 종료, 반복 복구 및 추가 append 유지 |
-| `write_sync_memory_failures` | write 0/12바이트 후 실패, 메모리 한도, fsync 실패 동안 대기한 쓰기는 로그와 메모리에 반영되지 않음 |
-| `prepare_failure_short_writes` | 준비 실패 시 로그/키 불변, 3바이트씩 짧은 write 반복 성공 및 replay |
-| `sigkill_during_append` | 동기화 완료 키 유지, 다음 append 지연 도중 SIGKILL, 미완료 요청의 연결 종료 |
-| `fsync_watermark_overlap` | fsync 도중 GET 완료, 새 PUT의 append는 이전 fsync 이후 시작, 다음 sync 후 SIGKILL 복구 |
-| `append_allows_get` | append 지연 중 GET이 이전 값을 반환하고, 뒤따른 DELETE가 진행 중인 PUT 이후 적용됨 |
-| `product_cache_scenarios` | 첫 MISS/두 번째 HIT/실제 TTL 만료/DELETE 후 MISS, origin 1→3, OFF 본문 동일, 덮어쓰기, Redis 장애 502 |
-
-오류/지연 주입은 `--test-hooks`를 명시해야 활성화된다. 기본에는 시험 HTTP 엔드포인트가 없다. 옵션은 `--append-delay-ms`, `--sync-delay-ms`, `--repair-delay-ms`, `--fail-write-after`(레코드별 성공 바이트 수, 기본 -1), `--write-chunk-size`, `--fail-sync 1`, `--fail-prepare 1`, `--events PATH`다. sync 지연은 **fsync syscall 직전**에 놓인 시험 지연이며 실제 커널 syscall을 느리게 만든 것이 아니다. 이벤트 파일은 epoch ms와 append_start/done/error, sync_start/done/error 및 target sequence, repair_truncated를 기록한다. 프로덕션 명령 계약과 분리했다. 실제 disk-full/파일시스템 I/O fault는 수행하지 않았고 동일 실패 분기를 시험 후크로 재현했다.
-
-## 백그라운드 append 변경 전후
-
-2026-11-17, 같은 WSL 환경에서 g++ `-std=c++20 -O2 -g -pthread`로 빌드하고 `engine_bench()`를 변경 전 → 후 → 후 → 전 순으로 실행했다. 각 실행은 GET 클라이언트 8개, 조건별 GET 1,600건이다. 수치는 버전별 두 실행의 범위이며 단위는 ms다. 요청 실패는 모두 0건이었다.
-
-| 조건과 지표 | 변경 전 | 변경 후 |
-|---|---:|---:|
-| append 50ms 지연, GET p95 | 50.18–50.24 | 3.93–4.34 |
-| append 50ms 지연, GET p99 | 53.92–54.33 | 5.32–6.82 |
-| append 50ms 지연, PUT p95 | 71.89–71.96 | 60.55–65.35 |
-| 지연 주입 없이 GET과 확장 PUT 600건, GET p95 | 5.92–5.97 | 6.21–6.71 |
-| 지연 주입 없이 GET과 확장 PUT 600건, PUT p95 | 7.92–9.40 | 8.73–10.18 |
-
-지연 주입은 느린 append가 다른 클라이언트에 미치는 영향을 확인하는 실험이다. 주입 없는 혼합 부하에서는 GET p95 개선이 관측되지 않았다. `fsync`가 길어지면 같은 스레드에 맡긴 새 append도 기다린다.
-
-같은 컴파일러와 플래그로 빌드한 두 바이너리를 지정해 엔진 벤치마크만 실행할 수 있다.
+| 단위 테스트 | 무작위 연산 40,000회, 리해싱, TTL, 메모리와 할당 실패 검사 통과 |
+| HTTP 통합 | 12개 그룹 통과. 동시 PUT/GET, 연결 한도, DELETE 이후 조회, AOF 손상·복구, 상품 캐시 검증 |
+| 카운터 통합 | 같은 이벤트의 동시 재전달, fsync 중 GET 진행, 성공 응답 후 SIGKILL 복구, 실패 주입 통과 |
+| 기존 AOF 호환 | 통합 전 문자열·TTL과 카운터 로그를 통합 서버에서 재생하고 이벤트 중복 제거 확인 |
+| CTest | Release 3/3, ASan·UBSan 3/3 통과. macOS의 ASan은 `detect_leaks=0`으로 실행 |
+| 조회 실습 | 실제 DBMS·Redis HTTP 연동, 재해싱·TTL 실습 API, DOM에서 버튼을 눌러 결과 표시까지 확인 |
 
 ```sh
-PYTHONPATH=benchmarks python3 -c 'import run; run.engine_bench()' ./build/mini-redis-before
-PYTHONPATH=benchmarks python3 -c 'import run; run.engine_bench()' ./build/mini-redis
+make build/engine-bench
+./build/engine-bench --compare-rehash
+./build/engine-bench --compare-ttl-lookup
+make benchmark
 ```
 
-## 기존 macOS 측정 환경과 재현
+append 변경 전후 측정은 `benchmarks/run.py`의 `engine_bench()`에 기존 `c4f3b9e`와 통합 버전의 바이너리를 번갈아 지정해 실행합니다. [측정 재현 명령](docs/protocol-and-recovery.md#append-측정-재현)
 
-아래 macOS 측정은 명령 스레드에서 동기 append를 실행하던 버전의 기록이다. 2026-11-16, Apple M2, RAM 8GiB, Darwin 25.5.0/macOS ARM64, Apple Clang 21.0.0, Python 3.9.6. 성능 수치는 Make **`-std=c++20 -O2 -g -pthread`** 빌드다. 모든 서비스/클라이언트는 loopback의 같은 호스트에 있다. 실행마다 OS의 빈 포트를 사용하고 임시 AOF를 생성/정리한다.
+## 한계
 
-```sh
-make -B -j2 all build/engine-bench
-python3 benchmarks/run.py ./build/mini-redis > benchmarks/run.log
-./build/engine-bench > benchmarks/engine-direct.txt
-```
-
-`benchmarks/results.json`은 환경, p50/p95/p99/max/RPS, 원본·HIT·MISS·실패 수, PUT 지연, 서버 재배치 로그, append/sync 이벤트, GET/PUT 시작·완료 raw monotonic ns 타임라인과 wall-clock 변환 기준점을 저장한다. 벤치마크 스크립트를 실행하면 이 관측 파일을 갱신한다. `benchmarks/run.log`에도 요약이 있다. 아래는 **한 번의 관측**이며 통계적 성능 향상 주장/신뢰구간은 아니다. 분위수는 정렬 후 nearest rank `ceil(n*q)-1`이다. 실패는 별도 집계하며 이번 모든 군에서 0이었다.
-
-상품 API는 매 비교 실행 전에 원본 파일 파싱을 끝내며 시작 시간은 지연에 넣지 않는다. 기본 3개 상품 대신 벤치마크가 512개 상품 JSON(짧은 id/name/price)을 생성한다. OFF 16회 워밍업 후, OFF/MISS/HIT 각각 같은 512개 ID를 1회 순회한다. MISS 전에 키들을 DELETE하고, 이어진 HIT는 MISS가 채운 동일 512개 캐시를 사용한다. TTL 120초. 동시성 1/8에서 worker별 strided 동일 순서이며 각 worker는 HTTP keep-alive를 사용한다(최초 TCP 연결 비용 포함). 상품 API→Mini Redis 연결은 요청마다 새 연결이다. 본문 동일성도 매 응답 확인한다. 원본 카운터는 워밍업/준비를 뺀 전후 차이다.
-
-| 군 | 동시 수 | 요청/고유 키 | p50 ms | p95 ms | 원본 호출 | HIT / MISS | 실패 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| OFF | 1 | 512 / 512 | 0.1732 | 0.5426 | 512 | 0 / 0 | 0 |
-| MISS | 1 | 512 / 512 | 0.4915 | 1.2649 | 512 | 0 / 512 | 0 |
-| HIT | 1 | 512 / 512 | 0.2500 | 0.3717 | 0 | 512 / 0 | 0 |
-| OFF | 8 | 512 / 512 | 0.8870 | 3.2362 | 512 | 0 / 0 | 0 |
-| MISS | 8 | 512 / 512 | 2.8701 | 5.4825 | 512 | 0 / 512 | 0 |
-| HIT | 8 | 512 / 512 | 1.8792 | 3.6390 | 0 | 512 / 0 | 0 |
-
-이 데이터에서는 원본이 이미 메모리에 있고 HIT 중앙값이 OFF보다 컸다. p95의 상대 순서는 동시 수와 스케줄링에 따라 달랐다. HIT은 원본 호출을 제거했지만 추가 HTTP 통신·JSON 처리 비용이 있다. MISS는 GET 404+원본+PUT까지 수행한다. 현실 DB/외부 API의 느린 원본을 흉내 낸 수치는 아니다. TTL/DELETE 후 MISS는 별도 기능 검사에서 확인했으며 대량 지연 측정 군에는 넣지 않았다.
-
-HTTP GET 병목은 모든 군에서 클라이언트 8개×200회=1,600 GET, 기존 3개 키의 64바이트 값을 같은 순서로 읽는다. barrier로 reader/writer를 함께 시작한다. 리해싱 군은 8회 확장했고 서버 종료 계측은 `shutdown appended=603 synced=603 moved=765 scanned=1020 max_scans=8 max_nodes=4 max_ns=10541`였다. 카운터의 `moved`는 모든 확장을 합한 이동 횟수이며 동일 엔트리가 여러 확장에서 다시 이동할 수 있다. append 지연 50ms 군의 PUT p50/p95는 59.1402/66.5945ms였고 GET 410개가 PUT 요청 구간과 겹쳤다. GET/PUT raw 구간과 서버 epoch 이벤트는 results.json에서 비교할 수 있다. 계측된 step 시간에는 재배치 중인 호출의 scheduler 선점도 포함된다. 재배치가 없는 호출은 시간 계측에서 제외한다.
-
-| 조건 | 동시/GET 수 | 관측 창 ms | p50 ms | p95 ms | p99 ms | 최대 ms | 겹친 GET/PUT 수 | 실패 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 8 / 1600 | 2000.253 | 0.5524 | 1.5056 | 3.2749 | 6.0122 | 0 / 0 | 0 |
-| rehash | 8 / 1600 | 2001.936 | 0.3473 | 1.0529 | 1.5456 | 2.4749 | 897 / 600 | 0 |
-| append_delay | 8 / 1600 | 2005.110 | 0.5526 | 52.8734 | 56.8837 | 59.6561 | 410 / 12 | 0 |
-| fsync_delay | 8 / 1600 | 2005.108 | 0.6363 | 1.4170 | 1.9603 | 2.8990 | 0 / 0 | 0 |
-
-리해싱 군은 8회 확장했고 서버 종료 계측은 `shutdown appended=603 synced=0 moved=765 scanned=1020 max_scans=8 max_nodes=4 max_ns=2417`였다. 카운터의 `moved`는 모든 확장을 합한 이동 횟수이며 동일 엔트리가 여러 확장에서 다시 이동할 수 있다. append 지연 50ms 군의 PUT p50/p95는 58.7632/67.8411ms였고 GET 411개가 PUT 요청 구간과 겹쳤다. GET/PUT raw 구간과 서버 epoch 이벤트는 results.json에서 비교할 수 있다. 계측된 step 시간에는 재배치가 진행 중인 호출의 scheduler 선점도 포함된다. 재배치가 없는 호출은 시간 계측에서 제외한다.
-
-모든 조건은 2초의 관측 창을 목표로 한다. worker당 5ms 간격의 고정 시각에 200회 GET을 시작하며, 이전 요청이 지연되면 그 worker는 완료 후 밀린 요청을 이어 보낸다. 600개 리해싱 PUT은 1.5ms 간격을 목표로 투입한다. 스케줄러 때문에 실제 창은 2초보다 조금 길 수 있으며 아래에 관측값을 적었다. CPU 부하/스케줄링은 통제하지 않았다. 리해싱 군의 p95가 baseline보다 작아도 개선을 증명하지 않는다. 점진적 재배치가 있어도 배열 준비/노드 이동/동기 append 중에는 한 실행 흐름에서 GET이 기다린다. 별도 fsync 지연 군은 같은 50ms급 대기 효과를 보이지 않았지만, 커널의 fsync가 다른 I/O나 append에 끼치는 영향까지 없다고 주장하지 않는다.
-
-직접 엔진 GET은 `benchmarks/engine.cpp`가 256키/64바이트 값으로 64회 호출을 한 묶음으로 측정해 호출당 ns로 나눈다. 조건별 10,000묶음=640,000 GET이며 loop/체크섬 누계/해시 비용과 timer overhead를 포함한다. **단건 지연 분위수가 아닌 묶음 평균의 분위수**다. 처음 단건 측정은 약 42ns 시계 해상도로 0이 나와 이 방식으로 바꿨다. PUT/rehash step 시간은 측정 묶음 밖이므로 직접 수치에는 HTTP 큐 대기가 들어가지 않는다. 초기 256키 채우기의 확장 카운터도 direct 로그에 포함된다.
-
-| 직접 GET 조건 | GET 수 | 묶음당 호출 수 | 호출당 p50 ns | p95 ns | p99 ns |
-|---|---:|---:|---:|---:|---:|
-| baseline | 640000 | 64 | 24.7344 | 31.25 | 33.8438 |
-| rehash | 640000 | 64 | 12.375 | 17.5781 | 20.8281 |
-
-## 평가 연결표와 한계
-
-| 평가 항목 | 구현 | 증거/결과 |
-|---|---|---|
-| 동시성 | 단일 poll 명령 실행, 백그라운드 append 후 commit | `concurrent_linearization`, `append_allows_get` |
-| 만료 | 절대 TTL/indexed heap/passive+active | 단위 시계·heap 검증, `http_contract`, `recovery_sigkill_tail_corruption_lock` 통과 |
-| 외부 API | 한 번 로드/공통 lookup/캐시 어사이드 | `product_cache_scenarios`, 6개 상품 측정 군 성공 |
-| 무효화 | append 후 엔트리+heap 제거 | DELETE 후 GET 80회 404, 상품 원본 재조회 통과 |
-| 장애 보존 | AOF/백그라운드 fsync/CRC/repair/잠금 | sync 경합·오류·SIGKILL·손상·repair 중단 그룹 모두 통과 |
-| 해시 엔진 | FNV/chaining/두 배열/이동 예산 | 단위 40,000회 참조 대조·충돌·다중 확장·validate 통과 |
-| 성능 | 원본/MISS/HIT, GET 원인별 지연 | c=1/8 상품 3,072회, HTTP GET 6,400회, direct GET 1,280,000회 실측 |
-
-필수 네 API, HTTP 서버, 자체 해시/TTL, AOF, 예제 API, 자동 테스트와 성능 측정은 구현했다. 제외 범위는 복제/클러스터/RESP/트랜잭션/추가 명령/메모리 축출/디스크 계층화다. AOF rewrite/압축은 없으므로 로그는 계속 커지고 복구는 로그 길이에 비례한다. 키 공간 cap은 RSS cap이 아니다. 헤더 이름/Content-Type 등은 제한된 HTTP subset이며 범용 웹 서버가 아니다. 대형 동시 워크로드에서 전체 메모리/RSS 압력이나 랜덤 해시 공격 방어를 인증하지 않았다(FNV는 비밀키 없는 해시).
-
-실제 전원 차단/스토리지 손실, ThreadSanitizer, 파일시스템 자체 오류/ENOSPC, 광범위한 장시간 soak/fuzz, allocator 실패 위치의 완전한 열거는 미검증이다. macOS ASan/UBSan 결과는 기존 버전에서 기록했다. 백그라운드 append 변경은 WSL에서 단위 테스트와 통합 테스트를 실행했다.
+- 로컬 단일 서버와 HTTP를 대상으로 합니다. RESP, 복제, 클러스터, 메모리 축출은 지원하지 않습니다.
+- AOF 재작성과 처리한 카운터 ID 정리가 없어 기록이 계속 늘어납니다. 서버의 메모리 한도는 키와 값의 논리 크기에 적용되며 프로세스 전체 RSS 한도와 다릅니다.
+- 이번 통합 검증 환경은 macOS입니다. 강제 종료와 파일 손상을 주입해 복구를 검증했으며 실제 전원 차단과 WSL 통합 재실행은 수행하지 않았습니다.

@@ -11,12 +11,12 @@ const cases = {
   id: "SELECT id, name, attack FROM characters WHERE id = 42;",
   top: "SELECT id, name, attack FROM characters WHERE attack >= 100 ORDER BY attack DESC, id ASC LIMIT 20;",
 };
-const engine = new URL("../../../../SW-AI-W11-12-REACT/src/engine/", import.meta.url);
+const engine = new URL("./engine/", import.meta.url);
 const assets = new Map([
   ["/", [new URL("index.html", import.meta.url), "text/html"]],
   ["/app.mjs", [new URL("app.mjs", import.meta.url), "text/javascript"]],
   ["/style.css", [new URL("style.css", import.meta.url), "text/css"]],
-  ...["component", "diff", "patch", "render"].map(name =>
+  ...["component", "diff", "patch", "props", "vdom"].map(name =>
     [`/engine/${name}.js`, [new URL(`${name}.js`, engine), "text/javascript"]]),
 ]);
 

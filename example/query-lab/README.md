@@ -4,7 +4,7 @@ Mini DBMS의 기본 키 조회와 조건 검색·정렬 결과를 Mini Redis에 
 
 ## 실행
 
-Windows에서는 **PowerShell 두 용도(데이터 생성, 웹 서버)**와 **WSL Bash 두 개(DBMS, Redis)**를 사용합니다. 명령은 모두 `example/`과 `Makefile`이 보이는 **안쪽 Redis 저장소 루트**를 기준으로 합니다. Windows에 Node.js 20 이상이 있으면 WSL에 Node.js를 따로 설치할 필요가 없습니다. Linux·macOS에서는 PowerShell 단계의 `node` 명령도 일반 셸에서 실행할 수 있습니다.
+Windows에서는 **PowerShell 두 용도(데이터 생성, 웹 서버)**와 **WSL Bash 두 개(DBMS, Redis)**를 사용합니다. 명령은 모두 `example/`과 `Makefile`이 보이는 **Redis 저장소 루트**를 기준으로 합니다. Windows에 Node.js 20 이상이 있으면 WSL에 Node.js를 따로 설치할 필요가 없습니다. Linux·macOS에서는 PowerShell 단계의 `node` 명령도 일반 셸에서 실행할 수 있습니다.
 
 1. **Windows PowerShell**에서 실습 데이터를 생성합니다. 이미 만든 `query-lab-data-*` 폴더가 있으면 이 단계는 건너뛰세요.
 
@@ -17,10 +17,10 @@ Windows에서는 **PowerShell 두 용도(데이터 생성, 웹 서버)**와 **WS
 2. **첫 번째 WSL Bash**에서 Mini DBMS를 실행합니다. PowerShell을 새로 열었다면 안쪽 저장소 루트에서 `wsl -- bash`를 입력해 전환한 뒤 아래 블록을 붙여넣으세요. DBMS 데이터는 WSL의 Linux 파일시스템에 둡니다.
 
    ```sh
-   make -C ../../SW-AI-W11-12-DBMS/reliable build/mini-db-server
+   make -C ../SW-AI-W11-12-DBMS/reliable build/mini-db-server
    db_dir=$(mktemp -d)
    cp ./query-lab-data-XXXXXX/characters.{schema,csv} "$db_dir/"
-   MINIDB_TOKEN=query-lab-local ../../SW-AI-W11-12-DBMS/reliable/build/mini-db-server \
+   MINIDB_TOKEN=query-lab-local ../SW-AI-W11-12-DBMS/reliable/build/mini-db-server \
      --data-dir "$db_dir" --port 18080 --threads 4
    ```
 

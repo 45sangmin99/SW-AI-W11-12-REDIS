@@ -186,6 +186,24 @@ class Keyspace {
         }
         return {std::move(n), e};
     }
+    // Two permanent entries are reserved together before WAL publication.
+    // Neither commit allocates; include both entries in the memory-limit check.
+    std::pair<Prepared, Prepared> prepare_pair(std::string k1, std::string v1,
+                                              std::string k2, std::string v2) {
+        if (k1 == k2)
+            throw std::logic_error("pair keys must differ");
+        auto a = prepare(std::move(k1), std::move(v1), 0);
+        auto b = prepare(std::move(k2), std::move(v2), 0);
+        size_t base = bytes_;
+        for (auto *p : {&a, &b})
+            if (p->existing)
+                base -= p->existing->key.size() + p->existing->value.size() + sizeof(Entry);
+        size_t need = a.node->key.size() + a.node->value.size() + b.node->key.size() +
+                      b.node->value.size() + 2 * sizeof(Entry);
+        if (need > limit_ || base > limit_ - need)
+            throw std::length_error("memory limit");
+        return {std::move(a), std::move(b)};
+    }
     // prepare() reserves all storage. Commit only swaps strings and links pointers.
     void commit(Prepared p) noexcept {
         auto *n = p.node.get();

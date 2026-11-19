@@ -46,6 +46,8 @@ struct PendingWrite {
     Keyspace::Prepared put;
     Entry *del;
     std::future<void> appended;
+    Keyspace::Prepared event{};
+    std::string success{};
 
     Entry *pinned() const { return del ? del : put.existing; }
 
@@ -53,12 +55,69 @@ struct PendingWrite {
         appended.get();
         if (del)
             ks.commit_delete(del);
-        else
+        else {
             ks.commit(std::move(put));
+            if (event.node)
+                ks.commit(std::move(event));
+        }
     }
 };
 std::string execute(const Request &r, Conn &client, Keyspace &ks, Aof &aof,
                     std::optional<PendingWrite> &pending, bool fail_prepare) {
+    if (r.path.rfind("/counters/", 0) == 0) {
+        auto segment = r.path.substr(10);
+        bool increment = false;
+        auto slash = segment.find('/');
+        if (slash != std::string::npos) {
+            if (segment.substr(slash) != "/incrbyonce")
+                throw HttpError(404, "route");
+            increment = true;
+            segment.resize(slash);
+        }
+        if (segment.find('?') != std::string::npos || segment.find('#') != std::string::npos)
+            throw HttpError(400, "query unsupported");
+        auto key = "@counter:" + decode(segment);
+        if (!valid_key(key))
+            throw HttpError(400, "counter key too long");
+        if (!increment) {
+            if (r.method != "GET")
+                throw HttpError(405, "method");
+            if (!r.body.empty())
+                throw HttpError(400, "unexpected body");
+            auto *entry = ks.get(key);
+            if (!entry)
+                throw HttpError(404, "counter not found");
+            return response(200, "{\"value\":" + quote(entry->value) + "}", r.close);
+        }
+        if (r.method != "POST")
+            throw HttpError(405, "method");
+        if (aof.failed)
+            throw HttpError(503, "write unavailable");
+        auto [event, delta] = Json(r.body).increment();
+        if (!valid_event_id(event))
+            throw HttpError(400, "event_id must be 64 lowercase hex characters");
+        auto prefix = key + "\n" + std::to_string(delta) + "\n";
+        if (auto *seen = ks.get("@event:" + event)) {
+            if (seen->value.rfind(prefix, 0) != 0)
+                throw HttpError(409, "event_id already bound to another increment");
+            return response(200, "{\"value\":" + quote(seen->value.substr(prefix.size())) +
+                                     ",\"applied\":false}", r.close);
+        }
+        auto *entry = ks.get(key);
+        int64_t value = entry ? counter_integer(entry->value) : 0;
+        if (value > INT64_MAX - delta)
+            throw HttpError(400, "counter overflow");
+        auto result = std::to_string(value + delta);
+        auto payload = event + "\n" + std::to_string(delta) + "\n" + result;
+        if (fail_prepare)
+            throw std::bad_alloc();
+        auto prepared = prepare_increment(ks, key, payload);
+        auto success = response(200, "{\"value\":" + quote(result) + ",\"applied\":true}", r.close);
+        auto appended = aof.submit('I', std::move(key), std::move(payload), 0);
+        pending.emplace(PendingWrite{client, r.close, std::move(prepared.first), nullptr,
+                                     std::move(appended), std::move(prepared.second), std::move(success)});
+        return {};
+    }
     if (r.path.rfind("/keys/", 0) != 0)
         throw HttpError(404, "route");
     std::string segment = r.path.substr(6);
@@ -73,6 +132,8 @@ std::string execute(const Request &r, Conn &client, Keyspace &ks, Aof &aof,
     if (segment.find('?') != std::string::npos || segment.find('#') != std::string::npos)
         throw HttpError(400, "query unsupported");
     auto key = decode(segment);
+    if (reserved_counter_key(key))
+        throw HttpError(400, "counter internals are reserved");
     if (r.method != "GET" && r.method != "PUT" && r.method != "DELETE")
         throw HttpError(405, "method");
     if (ttl && r.method != "GET")
@@ -225,7 +286,8 @@ int main(int argc, char **argv) {
             auto &client = pending->client;
             if (!client.closing) {
                 client.output += committed
-                    ? response(204, "", pending->close)
+                    ? (pending->success.empty() ? response(204, "", pending->close)
+                                                : std::move(pending->success))
                     : response(503, "{\"error\":\"write unavailable\"}", pending->close);
                 client.closing = pending->close || (client.eof && client.input.empty());
                 client.activity = std::chrono::steady_clock::now();
@@ -352,7 +414,7 @@ int main(int argc, char **argv) {
                             }
                             break;
                         }
-                        if (pending && (r->method == "PUT" || r->method == "DELETE")) {
+                        if (pending && (r->method == "PUT" || r->method == "DELETE" || r->method == "POST")) {
                             c.deferred = std::move(r);
                             break;
                         }

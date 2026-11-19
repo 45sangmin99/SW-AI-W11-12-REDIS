@@ -132,32 +132,74 @@ def backpressure_limits():
             for c in stalled:
                 c.close()
             s.close()
+    connection_limit_capacity()
 
+
+def connection_limit_capacity():
+    # A fresh process separates capacity from previous backpressure/close cleanup.
+    # A TCP handshake alone only proves that the kernel queued the connection.
+    # Read an HTTP response on each held socket to prove event-loop admission.
     with tempfile.TemporaryDirectory() as d:
         s = Server(BINARY, d, '--idle-seconds', '30', '--max-connections', '8')
-        clients = []
-        request = b'GET /keys/missing HTTP/1.1\r\nHost: x\r\n\r\n'
+        held = []
+        probe = b'GET /keys/connection-slot-probe HTTP/1.1\r\nHost: x\r\n\r\n'
+
+        def acknowledge(c):
+            c.sendall(probe)
+            r = http_client.HTTPResponse(c)
+            try:
+                r.begin()
+                assert r.status == 404 and not r.will_close, ('unexpected admission probe response', r.status)
+                r.read()
+            finally:
+                r.close()
+
+        def admitted_connection():
+            deadline = time.monotonic() + 5
+            last_error = None
+            while time.monotonic() < deadline:
+                assert s.proc.poll() is None, s.log.read_text()
+                c = None
+                try:
+                    c = socket.create_connection(('127.0.0.1', s.port), timeout=1)
+                    c.settimeout(2)
+                    acknowledge(c)
+                    return c
+                except (OSError, http_client.HTTPException) as error:
+                    # A readiness probe or the explicitly released slot may still
+                    # be closing. Retry until admission is observed, not assumed.
+                    last_error = error
+                    if c is not None:
+                        c.close()
+                    time.sleep(.01)
+                except BaseException:
+                    if c is not None:
+                        c.close()
+                    raise
+            raise AssertionError('server did not admit a connection within 5s') from last_error
+
         try:
             for _ in range(8):
-                c = socket.create_connection(('127.0.0.1', s.port), timeout=2)
-                clients.append(c)
-                c.sendall(request)
-                with http_client.HTTPResponse(c) as response:
-                    response.begin()
-                    assert response.status == 404 and not response.will_close
-                    response.read()
+                held.append(admitted_connection())
+            # Verify all eight are still live after the last admission. The long
+            # idle timeout keeps held slots alive throughout this bounded test.
+            for c in held:
+                acknowledge(c)
+                c.sendall(b'G')
             with socket.create_connection(('127.0.0.1', s.port), timeout=2) as extra:
+                extra.settimeout(2)
                 try:
-                    extra.sendall(request)
-                    data = extra.recv(100)
-                    assert data == b'', data
+                    extra.sendall(probe)
+                    received = extra.recv(100)
+                    assert received == b'', ('ninth admitted connection was not rejected', received)
                 except (ConnectionResetError, BrokenPipeError):
                     pass
-            clients[-1].shutdown(socket.SHUT_WR)
-            assert clients[-1].recv(1) == b''
-            assert s.call('GET', 'missing')[0] == 404
+            held.pop().close()
+            # Completion of a new HTTP response proves the released slot is
+            # reusable. No fixed sleep guesses when server-side cleanup finished.
+            held.append(admitted_connection())
         finally:
-            for c in clients:
+            for c in held:
                 c.close()
             s.close()
 

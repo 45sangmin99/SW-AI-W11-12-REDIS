@@ -1,5 +1,6 @@
 #pragma once
 #include "engine.hpp"
+#include "counter.hpp"
 #include "text.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -109,9 +110,9 @@ class Aof {
                      expiry = decode_number(head, 21, 8), kl = decode_number(head, 29, 4),
                      vl = decode_number(head, 33, 4);
             char op = head[20];
-            if (len < 41 || len > 1100000 || s != seq + 1 || (op != 'P' && op != 'D') || kl == 0 ||
+            if (len < 41 || len > 1100000 || s != seq + 1 || (op != 'P' && op != 'D' && op != 'I') || kl == 0 ||
                 kl > 512 || vl > 1048576 || 41 + kl + vl != len || expiry > uint64_t(INT64_MAX) ||
-                (op == 'D' && (vl || expiry)))
+                ((op == 'D' || op == 'I') && expiry) || (op == 'D' && vl))
                 throw std::runtime_error("AOF semantic corruption");
             if (uint64_t(st.st_size - pos) < len) {
                 repair(pos, st.st_size);
@@ -130,7 +131,11 @@ class Aof {
             std::string k = r.substr(37, kl);
             if (!valid_key(k) || (op == 'P' && !utf8(r.substr(37 + kl, vl))))
                 throw std::runtime_error("AOF text corruption");
-            if (op == 'P')
+            if (op == 'I') {
+                auto prepared = prepare_increment(ks, k, r.substr(37 + kl, vl));
+                ks.commit(std::move(prepared.first));
+                ks.commit(std::move(prepared.second));
+            } else if (op == 'P')
                 ks.put(k, r.substr(37 + kl, vl), expiry);
             else
                 ks.del(k);
@@ -236,6 +241,12 @@ class Aof {
         std::packaged_task<void()> job(
             [this, op, key = std::move(key), value = std::move(value), expiry] {
                 append(op, key, value, expiry);
+                if (op == 'I') {
+                    // A counter result is published only after its event is durable.
+                    sync_once();
+                    if (failed || synced.load() < appended.load())
+                        throw std::runtime_error("counter AOF sync failed");
+                }
             });
         auto result = job.get_future();
         {
